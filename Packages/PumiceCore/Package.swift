@@ -4,8 +4,7 @@ import PackageDescription
 let package = Package(
     name: "PumiceCore",
     platforms: [
-        .iOS(.v18),
-        .macOS(.v14)
+        .iOS(.v18)
     ],
     products: [
         .library(name: "PumiceCore", targets: ["PumiceCore"])
