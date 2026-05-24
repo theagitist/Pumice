@@ -28,16 +28,14 @@ private final class ModalCanvasView: PKCanvasView {
 /// `/Subtype /Highlight` when it snaps to text) on the underlying page via
 /// PumiceCore.
 ///
-/// Input modes (`PDFReaderController.fingerMode`):
-///   * Read: canvas is `userInteractionEnabled = false`. Every touch flows
-///     to PDFView — finger and pencil both scroll, annotation taps select.
-///   * Pencil: canvas is interactive with `drawingPolicy = .pencilOnly`
-///     and `requirePencilForHit = true`. Pencil touches are routed to the
-///     canvas for drawing; finger touches pass through the canvas to
-///     PDFView for scrolling. This is the PRD's headline UX.
-///   * Draw: canvas claims all touches with `drawingPolicy = .anyInput`.
-///     Both finger and pencil draw / snap to text; PDFView doesn't get
-///     touches and doesn't scroll.
+/// Input model (no mode switch — finger always scrolls, pencil always draws):
+///   * Default: canvas is interactive with `drawingPolicy = .pencilOnly`
+///     and `requirePencilForHit = true`. The Pencil draws and snaps to
+///     text; finger touches pass through the canvas to PDFView for scroll
+///     and annotation taps. This is the PRD's headline UX.
+///   * `allowFingerDrawing = true` (for users without a Pencil): canvas
+///     claims all touches with `drawingPolicy = .anyInput`. Finger draws,
+///     PDFView doesn't get touches and doesn't scroll while this is on.
 ///
 /// Commit model: PencilKit hates having its drawing mutated while a
 /// stroke is still being finalized or while the user might already be
@@ -134,19 +132,10 @@ final class PDFReaderViewController: UIViewController {
         }
     }
 
-    func applyFingerMode(_ mode: FingerInputMode) {
-        switch mode {
-        case .scroll:
-            canvasView.isUserInteractionEnabled = false
-        case .pencil:
-            canvasView.isUserInteractionEnabled = true
-            canvasView.requirePencilForHit = true
-            canvasView.drawingPolicy = .pencilOnly
-        case .draw:
-            canvasView.isUserInteractionEnabled = true
-            canvasView.requirePencilForHit = false
-            canvasView.drawingPolicy = .anyInput
-        }
+    func applyAllowFingerDrawing(_ allow: Bool) {
+        canvasView.isUserInteractionEnabled = true
+        canvasView.requirePencilForHit = !allow
+        canvasView.drawingPolicy = allow ? .anyInput : .pencilOnly
         updateToolPickerVisibility()
     }
 
@@ -168,12 +157,7 @@ final class PDFReaderViewController: UIViewController {
             target.removeAnnotation(annotation, from: page)
         }
         controller?.refreshState()
-        // PDFKit caches per-page rendered bitmaps. Calling
-        // `page.addAnnotation` updates the model but doesn't always
-        // invalidate the cache, so the newly-added annotation might not
-        // appear until the user scrolls or zooms. `layoutDocumentView`
-        // forces a full re-layout that re-renders the affected page.
-        pdfView.layoutDocumentView()
+        refreshPDFViewRendering()
     }
 
     func removeAnnotation(_ annotation: PDFAnnotation, from page: PDFPage) {
@@ -187,7 +171,22 @@ final class PDFReaderViewController: UIViewController {
             target.addAnnotation(annotation, to: page)
         }
         controller?.refreshState()
+        refreshPDFViewRendering()
+    }
+
+    /// Force PDFKit to re-render its visible pages after we've mutated
+    /// the annotation set. PDFKit caches per-page bitmaps in private
+    /// subviews of `documentView`; `layoutDocumentView()` alone doesn't
+    /// always invalidate those on iOS 26, so we also mark every page
+    /// subview as needing display. Without this, freshly-committed `/Ink`
+    /// or `/Highlight` annotations stay invisible until the user
+    /// scrolls or zooms — which then races with the canvas's idle clear
+    /// and produces the "stroke vanished" symptom.
+    private func refreshPDFViewRendering() {
         pdfView.layoutDocumentView()
+        pdfView.setNeedsDisplay()
+        pdfView.documentView?.setNeedsDisplay()
+        pdfView.documentView?.subviews.forEach { $0.setNeedsDisplay() }
     }
 
     func deleteSelectedAnnotation() {
@@ -302,7 +301,7 @@ final class PDFReaderViewController: UIViewController {
     private func clearCanvasIfIdle() {
         canvasView.drawing = PKDrawing()
         committedStrokeCount = 0
-        pdfView.setNeedsDisplay()
+        refreshPDFViewRendering()
     }
 
     private func commit(pkStroke: PKStroke, document: PDFDocument) -> Bool {

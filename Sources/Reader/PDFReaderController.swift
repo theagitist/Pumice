@@ -1,42 +1,14 @@
 import Foundation
 
-/// The reader's current input mode. Three discrete modes so the user
-/// can switch between "just navigating", "annotating with the pencil
-/// while the finger still scrolls" (the PRD's headline UX), and "draw
-/// freely with finger or pencil".
-enum FingerInputMode: String, CaseIterable, Identifiable, Sendable {
-    case scroll
-    case pencil
-    case draw
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .scroll: "Read"
-        case .pencil: "Pencil"
-        case .draw: "Draw"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .scroll: "book"
-        case .pencil: "applepencil"
-        case .draw: "scribble"
-        }
-    }
-}
-
 /// SwiftUI <-> UIKit bridge for the reader. Owns the @Published toolbar
 /// state and forwards user actions to the underlying view controller.
 @MainActor
 final class PDFReaderController: ObservableObject {
-    // Default to Pencil mode so the PRD's headline UX — Apple Pencil draws,
-    // finger scrolls — works the moment the user opens a PDF, with no
-    // toolbar interaction required.
-    @Published var fingerMode: FingerInputMode = .pencil {
-        didSet { viewController?.applyFingerMode(fingerMode) }
+    /// When true, the canvas accepts finger drawing as well as Pencil.
+    /// Default false: pencil draws, finger scrolls. Users without a Pencil
+    /// can flip this on from the toolbar to draw with a finger instead.
+    @Published var allowFingerDrawing: Bool = false {
+        didSet { viewController?.applyAllowFingerDrawing(allowFingerDrawing) }
     }
     @Published private(set) var canUndo: Bool = false
     @Published private(set) var canRedo: Bool = false
@@ -81,7 +53,7 @@ extension PDFReaderController {
     func attach(_ vc: PDFReaderViewController) {
         viewController = vc
         vc.controller = self
-        vc.applyFingerMode(fingerMode)
+        vc.applyAllowFingerDrawing(allowFingerDrawing)
         // `attach` is called from `make/updateUIViewController`, which runs
         // mid-view-update. Mutating `@Published` state here would trigger
         // SwiftUI's "publishing during view updates" fault and cause taps

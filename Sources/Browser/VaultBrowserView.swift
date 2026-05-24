@@ -149,14 +149,14 @@ struct VaultBrowserView: View {
 
     @ToolbarContentBuilder
     private var readerToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .topBarLeading) {
-            Picker("Finger", selection: $readerController.fingerMode) {
-                ForEach(FingerInputMode.allCases) { mode in
-                    Label(mode.label, systemImage: mode.systemImage).tag(mode)
-                }
+        ToolbarItem(placement: .topBarLeading) {
+            Toggle(isOn: $readerController.allowFingerDrawing) {
+                Image(systemName: readerController.allowFingerDrawing
+                      ? "hand.draw.fill"
+                      : "hand.draw")
             }
-            .pickerStyle(.segmented)
-            .help("Choose what your finger does. Apple Pencil always draws and snaps to text.")
+            .toggleStyle(.button)
+            .help("Off: pencil draws, finger scrolls. On: finger draws too (for when you don't have a Pencil).")
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
