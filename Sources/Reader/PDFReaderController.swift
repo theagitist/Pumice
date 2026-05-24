@@ -1,8 +1,10 @@
 import Foundation
 
-/// Which input the finger drives in the current reader. Apple Pencil
-/// always draws/snaps regardless of mode; this just controls what happens
-/// when the user touches the screen with a finger.
+/// The reader's current input mode. Applies uniformly to finger and
+/// Apple Pencil — switching modes is the explicit way to alternate
+/// between navigating and annotating. Earlier attempts to differentiate
+/// pencil vs finger automatically broke on real hardware (PencilKit
+/// drawing-count-mismatch faults, PDFKit hit-test hierarchy errors).
 enum FingerInputMode: String, CaseIterable, Identifiable, Sendable {
     case scroll
     case draw
@@ -11,14 +13,14 @@ enum FingerInputMode: String, CaseIterable, Identifiable, Sendable {
 
     var label: String {
         switch self {
-        case .scroll: "Scroll"
-        case .draw: "Draw"
+        case .scroll: "Read"
+        case .draw: "Annotate"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .scroll: "hand.draw"
+        case .scroll: "book"
         case .draw: "pencil.tip"
         }
     }
