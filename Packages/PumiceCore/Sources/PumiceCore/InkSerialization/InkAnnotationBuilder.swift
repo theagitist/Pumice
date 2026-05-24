@@ -22,10 +22,32 @@ public enum InkAnnotationBuilder {
         pageIndex: Int,
         uuid: UUID = UUID()
     ) -> PDFAnnotation {
-        let cgPath = stroke.pdfPath(on: geometry)
-        let pdfStrokeWidth = geometry.pdfLength(fromCanvas: stroke.width)
+        let pagePoints = stroke.points.map { geometry.pdfPoint(fromCanvas: $0) }
+        let pageStrokeWidth = geometry.pdfLength(fromCanvas: stroke.width)
+        return makeAnnotation(
+            pagePoints: pagePoints,
+            pageStrokeWidth: pageStrokeWidth,
+            color: stroke.color,
+            pageIndex: pageIndex,
+            uuid: uuid
+        )
+    }
+
+    /// Build a `/Ink` annotation from points already in PDF user space.
+    ///
+    /// Use this when the caller has already converted a canvas-space stroke
+    /// into page coordinates (e.g. via `PDFView.convert(_:to: PDFPage)`),
+    /// avoiding the round-trip through `PageGeometry`.
+    public static func makeAnnotation(
+        pagePoints: [CGPoint],
+        pageStrokeWidth: CGFloat,
+        color: StrokeColor,
+        pageIndex: Int,
+        uuid: UUID = UUID()
+    ) -> PDFAnnotation {
+        let cgPath = Stroke.smoothPath(through: pagePoints)
         let bounds = cgPath.boundingBoxOfPath
-            .insetBy(dx: -pdfStrokeWidth, dy: -pdfStrokeWidth)
+            .insetBy(dx: -pageStrokeWidth, dy: -pageStrokeWidth)
 
         let id = AnnotationID(pageIndex: pageIndex, annotationUUID: uuid)
         let annotation = PDFAnnotation(
@@ -39,9 +61,9 @@ public enum InkAnnotationBuilder {
         // page is serialized.
         annotation.add(UIBezierPath(cgPath: cgPath))
 
-        annotation.color = stroke.color.uiColor
+        annotation.color = color.uiColor
         let border = PDFBorder()
-        border.lineWidth = pdfStrokeWidth
+        border.lineWidth = pageStrokeWidth
         annotation.border = border
 
         // Persist the deterministic ID. Empirically, iOS PDFKit's writer

@@ -4,6 +4,8 @@ struct VaultBrowserView: View {
     let vaultURL: URL
 
     @EnvironmentObject private var vault: VaultStore
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var readerController = PDFReaderController()
     @State private var pdfs: [PDFEntry] = []
     @State private var selection: PDFEntry?
     @State private var loadError: String?
@@ -15,6 +17,11 @@ struct VaultBrowserView: View {
             detail
         }
         .task(id: vaultURL) { await loadPDFs() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active {
+                readerController.saveIfNeeded()
+            }
+        }
     }
 
     private var sidebar: some View {
@@ -65,7 +72,7 @@ struct VaultBrowserView: View {
     @ViewBuilder
     private var detail: some View {
         if let entry = selection {
-            PDFReaderView(pdfURL: entry.url)
+            PDFReaderView(pdfURL: entry.url, controller: readerController)
                 .id(entry.url)
                 .ignoresSafeArea(edges: .bottom)
                 .navigationTitle(entry.url.deletingPathExtension().lastPathComponent)
