@@ -68,6 +68,7 @@ final class PDFReaderViewController: UIViewController {
     private let _undoManager = UndoManager()
     private var selectedAnnotation: PDFAnnotation?
     private var selectedAnnotationPage: PDFPage?
+    private var pendingAnnotationsSinceLastRender = false
 
     weak var controller: PDFReaderController?
 
@@ -153,16 +154,17 @@ final class PDFReaderViewController: UIViewController {
     func addAnnotation(_ annotation: PDFAnnotation, to page: PDFPage) {
         page.addAnnotation(annotation)
         needsSave = true
+        pendingAnnotationsSinceLastRender = true
         _undoManager.registerUndo(withTarget: self) { target in
             target.removeAnnotation(annotation, from: page)
         }
         controller?.refreshState()
-        invalidatePageRendering(page)
     }
 
     func removeAnnotation(_ annotation: PDFAnnotation, from page: PDFPage) {
         page.removeAnnotation(annotation)
         needsSave = true
+        pendingAnnotationsSinceLastRender = true
         if selectedAnnotation === annotation {
             selectedAnnotation = nil
             selectedAnnotationPage = nil
@@ -171,20 +173,51 @@ final class PDFReaderViewController: UIViewController {
             target.addAnnotation(annotation, to: page)
         }
         controller?.refreshState()
-        invalidatePageRendering(page)
     }
 
-    /// Force PDFKit to invalidate its cached bitmap for `page` and
-    /// re-render with the current annotation list. The toggle of
-    /// `displaysAnnotations` is the cleanest known kick — PDFKit
-    /// observes the change and treats it as a render-affecting state
-    /// change, dropping the cached bitmap. `setNeedsDisplay` alone on
-    /// the page subview is not enough on iOS 26.
-    private func invalidatePageRendering(_ page: PDFPage) {
-        page.displaysAnnotations = false
-        page.displaysAnnotations = true
-        pdfView.layoutDocumentView()
-        pdfView.documentView?.subviews.forEach { $0.setNeedsDisplay() }
+    /// Force PDFKit to render the annotations we just added. iOS 26
+    /// PDFKit doesn't synthesize the `/AP` appearance stream from an
+    /// in-memory `/Ink` or `/Highlight` annotation on the fly — the
+    /// stream is only generated when the document is written. So we do
+    /// an in-memory roundtrip: serialize the current document with
+    /// `dataRepresentation()` and reload it via `PDFDocument(data:)`.
+    /// The reloaded annotations have the appearance streams PDFKit
+    /// needs to render, so the page subviews actually show them.
+    ///
+    /// Cost: undo stack resets because the old `PDFPage` and
+    /// `PDFAnnotation` references no longer belong to the document.
+    /// This is acceptable — undo is per-drawing-session, and the
+    /// roundtrip only fires after 2 s of pen-idle (via the canvas
+    /// idle clear).
+    private func reloadDocumentInMemoryToRender() {
+        guard pendingAnnotationsSinceLastRender,
+              let document = pdfView.document
+        else { return }
+        print("[Pumice] reloadDocumentInMemoryToRender: starting")
+        let savedDestination = pdfView.currentDestination
+        guard let data = document.dataRepresentation() else {
+            print("[Pumice] reloadDocumentInMemoryToRender: dataRepresentation failed")
+            return
+        }
+        guard let reloaded = PDFDocument(data: data) else {
+            print("[Pumice] reloadDocumentInMemoryToRender: PDFDocument(data:) failed")
+            return
+        }
+        pdfView.document = reloaded
+        if let dest = savedDestination, let page = reloaded.page(at: 0) {
+            // currentDestination's page belongs to the old document; rebind
+            // to the same coords on the corresponding page in the reload.
+            let pageIndex = document.index(for: dest.page ?? page)
+            if let newPage = reloaded.page(at: pageIndex) {
+                pdfView.go(to: PDFDestination(page: newPage, at: dest.point))
+            }
+        }
+        _undoManager.removeAllActions()
+        selectedAnnotation = nil
+        selectedAnnotationPage = nil
+        controller?.refreshState()
+        pendingAnnotationsSinceLastRender = false
+        print("[Pumice] reloadDocumentInMemoryToRender: done, \(data.count) bytes roundtripped")
     }
 
     func deleteSelectedAnnotation() {
@@ -316,18 +349,13 @@ final class PDFReaderViewController: UIViewController {
 
     private func clearCanvasIfIdle() {
         print("[Pumice] clearCanvasIfIdle: wiping canvas after delay")
+        // Reload the document in-memory FIRST so PDFKit gets the
+        // appearance streams it needs to render the new annotations.
+        // Then wipe the canvas so the live strokes hand off cleanly to
+        // the now-rendered PDF annotations.
+        reloadDocumentInMemoryToRender()
         canvasView.drawing = PKDrawing()
         committedStrokeCount = 0
-        if let doc = pdfView.document {
-            for i in 0..<doc.pageCount {
-                if let page = doc.page(at: i) {
-                    page.displaysAnnotations = false
-                    page.displaysAnnotations = true
-                }
-            }
-        }
-        pdfView.layoutDocumentView()
-        pdfView.documentView?.subviews.forEach { $0.setNeedsDisplay() }
     }
 
     private func commit(pkStroke: PKStroke, document: PDFDocument) -> Bool {

@@ -9,9 +9,10 @@ struct VaultBrowserView: View {
 
     @State private var scanResult: VaultScanner.Result?
     @State private var selection: URL?
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
         } detail: {
             detail
@@ -194,9 +195,11 @@ struct VaultBrowserView: View {
 
         // After the tree is loaded, jump back to whatever PDF was open
         // last session — but only if the user hasn't already picked
-        // something in this session.
+        // something in this session. When we do restore, collapse the
+        // sidebar so the user lands straight in the reader.
         if selection == nil, let restored = vault.resolveLastOpened() {
             selection = restored
+            columnVisibility = .detailOnly
         }
     }
 }
