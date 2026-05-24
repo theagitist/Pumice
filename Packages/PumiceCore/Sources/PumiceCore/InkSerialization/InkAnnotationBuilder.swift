@@ -27,6 +27,7 @@ public enum InkAnnotationBuilder {
         let bounds = cgPath.boundingBoxOfPath
             .insetBy(dx: -pdfStrokeWidth, dy: -pdfStrokeWidth)
 
+        let id = AnnotationID(pageIndex: pageIndex, annotationUUID: uuid)
         let annotation = PDFAnnotation(
             bounds: bounds,
             forType: .ink,
@@ -35,8 +36,7 @@ public enum InkAnnotationBuilder {
 
         // PDFAnnotation's ink path is added in PDF page coordinates, matching
         // /Rect. PDFKit takes care of writing the /InkList entries when the
-        // page is serialized. Verified empirically by round-trip; revisit
-        // if reader compatibility breaks.
+        // page is serialized.
         annotation.add(UIBezierPath(cgPath: cgPath))
 
         annotation.color = stroke.color.uiColor
@@ -44,8 +44,14 @@ public enum InkAnnotationBuilder {
         border.lineWidth = pdfStrokeWidth
         annotation.border = border
 
-        let id = AnnotationID(pageIndex: pageIndex, annotationUUID: uuid)
-        annotation.setValue(id.stringValue, forAnnotationKey: .name)
+        // Persist the deterministic ID. Empirically, iOS PDFKit's writer
+        // drops `/NM` (PDFAnnotationKey.name) on write — even when set via
+        // `withProperties:` at construction. /T (the annotation's
+        // user-name entry, exposed as `userName`) does survive a write/read
+        // cycle, so we use it as the stable identifier slot. Other PDF
+        // readers will surface this as the annotation author; that's a
+        // worthwhile trade for a deterministic, reconcilable ID.
+        annotation.userName = id.stringValue
 
         return annotation
     }

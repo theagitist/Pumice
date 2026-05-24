@@ -20,6 +20,7 @@ public enum HighlightAnnotationBuilder {
         uuid: UUID = UUID()
     ) -> PDFAnnotation {
         let bounds = HighlightGeometry.boundingRect(highlight.quads)
+        let id = AnnotationID(pageIndex: highlight.pageIndex, annotationUUID: uuid)
         let annotation = PDFAnnotation(
             bounds: bounds,
             forType: .highlight,
@@ -37,8 +38,10 @@ public enum HighlightAnnotationBuilder {
         annotation.color = highlight.color.rgba.uiColor
         annotation.contents = highlight.extractedText
 
-        let id = AnnotationID(pageIndex: highlight.pageIndex, annotationUUID: uuid)
-        annotation.setValue(id.stringValue, forAnnotationKey: .name)
+        // See InkAnnotationBuilder for the rationale: /NM is dropped by
+        // PDFKit's writer on iOS, so we persist the deterministic ID via
+        // /T (`userName`) instead.
+        annotation.userName = id.stringValue
 
         return annotation
     }
