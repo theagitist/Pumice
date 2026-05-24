@@ -19,9 +19,29 @@ import UIKit
 /// SwiftUI's `scenePhase` observer (app backgrounding). The current save is
 /// a direct `PDFDocument.write(to:)` — F06's `.bak` + hash-guarded atomic
 /// swap will replace it.
+/// A `PKCanvasView` that passes finger touches through to the view
+/// underneath. Required because `PKCanvasView` is a `UIScrollView` subclass
+/// that otherwise consumes every touch in its bounds — including the
+/// finger pans we need to reach `PDFView`'s scroll gesture so the user can
+/// navigate pages.
+private final class PencilOnlyCanvasView: PKCanvasView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Only claim touches when the current event contains an Apple
+        // Pencil touch. Without that signal, hand the touch off to whatever
+        // is below us in the view hierarchy.
+        guard let event,
+              let touches = event.allTouches,
+              touches.contains(where: { $0.type == .pencil })
+        else {
+            return nil
+        }
+        return super.hitTest(point, with: event)
+    }
+}
+
 final class PDFReaderViewController: UIViewController {
     private let pdfView = PDFView()
-    private let canvasView = PKCanvasView()
+    private let canvasView = PencilOnlyCanvasView()
     private let toolPicker = PKToolPicker()
     private var pdfURL: URL?
     private var needsSave = false

@@ -81,6 +81,15 @@ struct VaultBrowserView: View {
                             .foregroundStyle(.orange)
                     }
                 }
+            } actions: {
+                Button {
+                    vault.forget()
+                } label: {
+                    Label("Choose a different vault…", systemImage: "folder.badge.gear")
+                        .padding(.horizontal, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             }
         }
     }
