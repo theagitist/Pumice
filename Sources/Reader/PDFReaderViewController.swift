@@ -149,14 +149,69 @@ final class PDFReaderViewController: UIViewController {
             widthSum += (point.size.width + point.size.height) / 2
             widthCount += 1
         }
-        guard widthCount > 0 else { return false }
+        guard widthCount > 0, let first = pagePoints.first, let last = pagePoints.last else {
+            return false
+        }
         let width = widthSum / CGFloat(widthCount)
+        let strokeColor = StrokeColor(uiColor: pkStroke.ink.color)
 
+        // Snap-to-text first: if the stroke's endpoints resolve to a text
+        // selection, this stroke becomes a /Highlight on the underlying
+        // text rather than freehand ink.
+        if Self.trySnapToText(
+            firstPagePoint: first,
+            lastPagePoint: last,
+            on: page,
+            pageIndex: pageIndex,
+            strokeColor: strokeColor
+        ) {
+            return true
+        }
+
+        // Fall back to /Ink.
         let annotation = InkAnnotationBuilder.makeAnnotation(
             pagePoints: pagePoints,
             pageStrokeWidth: width,
-            color: StrokeColor(uiColor: pkStroke.ink.color),
+            color: strokeColor,
             pageIndex: pageIndex,
+            uuid: UUID()
+        )
+        page.addAnnotation(annotation)
+        return true
+    }
+
+    /// Try to resolve a pencil gesture into a snap-to-text highlight. If
+    /// `PDFPage.selection(from:to:)` returns non-empty text, builds a
+    /// `/Highlight` annotation via PumiceCore and attaches it to the page;
+    /// the caller then discards the freehand ink in favour of the snap.
+    ///
+    /// Exposed as a static helper so iOS integration tests can drive it
+    /// against a real `PDFPage` without standing up a live `PDFView` and
+    /// `PKCanvasView`.
+    static func trySnapToText(
+        firstPagePoint: CGPoint,
+        lastPagePoint: CGPoint,
+        on page: PDFPage,
+        pageIndex: Int,
+        strokeColor: StrokeColor
+    ) -> Bool {
+        guard let selection = page.selection(from: firstPagePoint, to: lastPagePoint),
+              let text = selection.string,
+              !text.isEmpty
+        else { return false }
+
+        let quads = PDFSelectionAdapter.quads(from: selection, on: page)
+        guard !quads.isEmpty else { return false }
+
+        let highlight = Highlight(
+            quads: quads,
+            color: HighlightColor.closest(to: strokeColor),
+            pageIndex: pageIndex,
+            extractedText: text,
+            attachedNote: nil
+        )
+        let annotation = HighlightAnnotationBuilder.makeAnnotation(
+            highlight: highlight,
             uuid: UUID()
         )
         page.addAnnotation(annotation)
@@ -166,6 +221,13 @@ final class PDFReaderViewController: UIViewController {
 
 extension PDFReaderViewController: PKCanvasViewDelegate {
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        // Only the inking tools produce strokes we should serialize. Eraser
+        // and lasso are passthrough on the canvas — clearing residual marks
+        // keeps the canvas tidy without committing anything to the PDF.
+        guard canvasView.tool is PKInkingTool else {
+            canvasView.drawing = PKDrawing()
+            return
+        }
         commitStrokesAndClear()
     }
 }

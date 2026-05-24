@@ -70,6 +70,53 @@ struct HighlightColorRGBATests {
     }
 }
 
+@Suite("HighlightColor closest match")
+struct HighlightColorClosestTests {
+    @Test("Each colour's own rgba round-trips to itself")
+    func exactMatchSelf() {
+        for color in HighlightColor.allCases {
+            #expect(HighlightColor.closest(to: color.rgba) == color)
+        }
+    }
+
+    @Test("Tiny RGB perturbations still resolve to the same colour", arguments: [
+        HighlightColor.yellow,
+        .green,
+        .blue,
+        .red,
+        .purple
+    ])
+    func robustToPerturbation(_ color: HighlightColor) {
+        let base = color.rgba
+        let perturbed = StrokeColor(
+            red: max(0, min(1, base.red + 0.02)),
+            green: max(0, min(1, base.green - 0.02)),
+            blue: max(0, min(1, base.blue + 0.01)),
+            alpha: base.alpha
+        )
+        #expect(HighlightColor.closest(to: perturbed) == color)
+    }
+
+    @Test("Saturated red picks .red, not yellow")
+    func saturatedRed() {
+        let red = StrokeColor(red: 0.95, green: 0.10, blue: 0.10, alpha: 1.0)
+        #expect(HighlightColor.closest(to: red) == .red)
+    }
+
+    @Test("Saturated blue picks .blue")
+    func saturatedBlue() {
+        let blue = StrokeColor(red: 0.05, green: 0.20, blue: 0.95, alpha: 1.0)
+        #expect(HighlightColor.closest(to: blue) == .blue)
+    }
+
+    @Test("Alpha is ignored when matching")
+    func alphaIgnored() {
+        let yellow = HighlightColor.yellow.rgba
+        let translucent = StrokeColor(red: yellow.red, green: yellow.green, blue: yellow.blue, alpha: 0.2)
+        #expect(HighlightColor.closest(to: translucent) == .yellow)
+    }
+}
+
 @Suite("Highlight bridge to Annotation")
 struct HighlightAnnotationBridgeTests {
     @Test("annotation(uuid:) propagates text/colour/note and uses pageIndex from the highlight")
