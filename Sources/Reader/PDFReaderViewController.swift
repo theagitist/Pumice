@@ -176,20 +176,22 @@ final class PDFReaderViewController: UIViewController {
     }
 
     /// Force PDFKit to render the annotations we just added. iOS 26
-    /// PDFKit doesn't synthesize the `/AP` appearance stream from an
-    /// in-memory `/Ink` or `/Highlight` annotation on the fly — the
-    /// stream is only generated when the document is written. So we do
-    /// an in-memory roundtrip: serialize the current document with
-    /// `dataRepresentation()` and reload it via `PDFDocument(data:)`.
-    /// The reloaded annotations have the appearance streams PDFKit
-    /// needs to render, so the page subviews actually show them.
+    /// PDFKit only synthesizes the `/AP` appearance stream PDFKit
+    /// itself needs to render `/Ink` and `/Highlight` annotations
+    /// when the document is **written to disk**. The in-memory
+    /// `dataRepresentation()` path does NOT generate `/AP`, even
+    /// though it does preserve the annotation data — so the reloaded
+    /// document parses cleanly but stays invisible.
     ///
-    /// Preserves the user's scroll position and zoom by capturing the
-    /// visible page's index and the page-coords point currently at the
-    /// top-left of the viewport, then re-navigating to that same point
-    /// on the equivalent page in the reloaded document. `autoScales`
-    /// is briefly disabled so the document-set doesn't snap to a fit
-    /// scale.
+    /// Workaround: write the current document to a temp file (forces
+    /// `/AP` generation), then reload from that file. The user's
+    /// vault PDF is left untouched — that's F06's job, with its own
+    /// `.bak` + hash-guarded atomic rename. The temp file is cleaned
+    /// up immediately.
+    ///
+    /// Viewport state (page index, top-left page point, scaleFactor)
+    /// is captured before the swap and restored after, with
+    /// `autoScales` disabled so PDFKit doesn't snap to a fit scale.
     ///
     /// Cost: undo stack resets because the old `PDFPage` and
     /// `PDFAnnotation` references no longer belong to the document.
@@ -206,23 +208,24 @@ final class PDFReaderViewController: UIViewController {
         let visiblePage = pdfView.currentPage
         let visiblePageIndex = visiblePage.map { document.index(for: $0) } ?? 0
         let viewportTopLeftInPage: CGPoint? = visiblePage.map { page in
-            // Top-left of the PDFView, expressed in the visible page's coords.
             pdfView.convert(CGPoint(x: pdfView.bounds.minX, y: pdfView.bounds.minY),
                             to: page)
         }
         let savedScale = pdfView.scaleFactor
 
-        guard let data = document.dataRepresentation() else {
-            print("[Pumice] reloadDocumentInMemoryToRender: dataRepresentation failed")
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pumice-roundtrip-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        guard document.write(to: tmpURL) else {
+            print("[Pumice] reloadDocumentInMemoryToRender: write to tmp failed")
             return
         }
-        guard let reloaded = PDFDocument(data: data) else {
-            print("[Pumice] reloadDocumentInMemoryToRender: PDFDocument(data:) failed")
+        guard let reloaded = PDFDocument(url: tmpURL) else {
+            print("[Pumice] reloadDocumentInMemoryToRender: reload from tmp failed")
             return
         }
 
-        // Disable autoScales briefly so PDFView doesn't snap to a fit
-        // scale when we swap documents.
         pdfView.autoScales = false
         pdfView.document = reloaded
         pdfView.scaleFactor = savedScale
@@ -232,10 +235,7 @@ final class PDFReaderViewController: UIViewController {
            let topLeft = viewportTopLeftInPage {
             pdfView.go(to: PDFDestination(page: newPage, at: topLeft))
         }
-        // Leave autoScales off — re-enabling here would immediately
-        // re-fit and undo the navigation we just did.
 
-        // Log how many of our annotations actually round-tripped.
         var totalInk = 0
         var totalHighlight = 0
         for i in 0..<reloaded.pageCount {
@@ -249,7 +249,8 @@ final class PDFReaderViewController: UIViewController {
                 }
             }
         }
-        print("[Pumice] reloadDocumentInMemoryToRender: done, \(data.count) bytes, post-reload counts ink=\(totalInk) highlight=\(totalHighlight)")
+        let tmpSize = (try? FileManager.default.attributesOfItem(atPath: tmpURL.path)[.size] as? Int) ?? -1
+        print("[Pumice] reloadDocumentInMemoryToRender: done via tmp \(tmpSize) bytes, post-reload counts ink=\(totalInk) highlight=\(totalHighlight)")
 
         _undoManager.removeAllActions()
         selectedAnnotation = nil
