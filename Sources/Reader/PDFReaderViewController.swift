@@ -3,40 +3,16 @@ import PencilKit
 import PumiceCore
 import UIKit
 
-/// A `PKCanvasView` that can be flipped between "claim every touch" (draw
-/// mode) and "claim Pencil only, pass fingers through" (scroll mode).
-///
-/// In scroll mode the claim-by-default heuristic prefers letting the
-/// canvas keep the touch when `event.allTouches` is missing or empty — Apple
-/// Pencil drawing is the more important behaviour to preserve, since the
-/// user can always switch to draw mode if a particular finger pan fails to
-/// reach `PDFView`. Touches that we positively know are finger-only fall
-/// through to whatever sits underneath the canvas.
-private final class ModalCanvasView: PKCanvasView {
-    var passesThroughNonPencilTouches: Bool = true
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard passesThroughNonPencilTouches else {
-            return super.hitTest(point, with: event)
-        }
-        guard let event,
-              let touches = event.allTouches,
-              !touches.isEmpty
-        else {
-            return super.hitTest(point, with: event)
-        }
-        if touches.contains(where: { $0.type == .pencil }) {
-            return super.hitTest(point, with: event)
-        }
-        return nil
-    }
-}
-
 /// Hosts a `PDFView` for browsing and a `PKCanvasView` overlay for Apple
 /// Pencil annotation. Commits each completed stroke as a `/Subtype /Ink`
 /// (or `/Subtype /Highlight` when it snaps to text) on the underlying page
 /// via PumiceCore, then clears the canvas so PDFKit re-renders the
 /// committed annotation from the document itself.
+///
+/// Canvas placement: the canvas is parented inside `PDFView.documentView`
+/// rather than overlaid as a sibling. That way PDFView's own scroll gesture
+/// handles finger pans without us needing any hitTest gymnastics — the
+/// canvas just sets `drawingPolicy` to gate pencil vs. any-input drawing.
 ///
 /// Editing toolbar (driven by `PDFReaderController`): undo / redo / delete
 /// the currently selected annotation. All mutations go through
@@ -48,10 +24,11 @@ private final class ModalCanvasView: PKCanvasView {
 /// hash-guarded atomic swap will replace the direct `PDFDocument.write`.
 final class PDFReaderViewController: UIViewController {
     private let pdfView = PDFView()
-    private let canvasView = ModalCanvasView()
+    private let canvasView = PKCanvasView()
     private let toolPicker = PKToolPicker()
     private var pdfURL: URL?
     private var needsSave = false
+    private var canvasAttached = false
 
     private let _undoManager = UndoManager()
     private var selectedAnnotation: PDFAnnotation?
@@ -70,7 +47,7 @@ final class PDFReaderViewController: UIViewController {
         view.backgroundColor = .systemBackground
 
         configurePDFView()
-        configureCanvasOverlay()
+        configureCanvas()
 
         NotificationCenter.default.addObserver(
             self,
@@ -104,6 +81,7 @@ final class PDFReaderViewController: UIViewController {
 
         guard let document = PDFDocument(url: url) else { return }
         pdfView.document = document
+        attachCanvasToDocumentViewIfNeeded()
     }
 
     func saveIfNeeded() {
@@ -117,10 +95,8 @@ final class PDFReaderViewController: UIViewController {
         switch mode {
         case .scroll:
             canvasView.drawingPolicy = .pencilOnly
-            canvasView.passesThroughNonPencilTouches = true
         case .draw:
             canvasView.drawingPolicy = .anyInput
-            canvasView.passesThroughNonPencilTouches = false
         }
     }
 
@@ -185,7 +161,7 @@ final class PDFReaderViewController: UIViewController {
         controller?.refreshState()
     }
 
-    // MARK: - Views
+    // MARK: - View setup
 
     private func configurePDFView() {
         pdfView.translatesAutoresizingMaskIntoConstraints = false
@@ -204,23 +180,43 @@ final class PDFReaderViewController: UIViewController {
         ])
     }
 
-    private func configureCanvasOverlay() {
+    private func configureCanvas() {
         canvasView.translatesAutoresizingMaskIntoConstraints = false
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.drawingPolicy = .pencilOnly
-        canvasView.passesThroughNonPencilTouches = true
+        // The canvas lives inside PDFView's documentView, which is itself
+        // inside the PDFView's scroll view. Disable the canvas's own
+        // scroll/zoom so the parent's scrolling drives motion.
+        canvasView.isScrollEnabled = false
         canvasView.minimumZoomScale = 1
         canvasView.maximumZoomScale = 1
         canvasView.delegate = self
-        view.addSubview(canvasView)
+    }
 
+    /// Add `canvasView` as a subview of `pdfView.documentView` so finger
+    /// touches naturally reach PDFView's scroll gesture and the canvas only
+    /// intercepts pencil input (per `drawingPolicy`).
+    private func attachCanvasToDocumentViewIfNeeded() {
+        // documentView isn't always available immediately after setting
+        // pdfView.document — PDFView lays it out on the next runloop tick.
+        // Retry until it's ready.
+        guard let docView = pdfView.documentView else {
+            DispatchQueue.main.async { [weak self] in
+                self?.attachCanvasToDocumentViewIfNeeded()
+            }
+            return
+        }
+        canvasView.removeFromSuperview()
+        docView.addSubview(canvasView)
+        canvasView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            canvasView.topAnchor.constraint(equalTo: view.topAnchor),
-            canvasView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            canvasView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            canvasView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+            canvasView.topAnchor.constraint(equalTo: docView.topAnchor),
+            canvasView.bottomAnchor.constraint(equalTo: docView.bottomAnchor),
+            canvasView.leadingAnchor.constraint(equalTo: docView.leadingAnchor),
+            canvasView.trailingAnchor.constraint(equalTo: docView.trailingAnchor)
         ])
+        canvasAttached = true
     }
 
     // MARK: - Stroke commit
@@ -239,10 +235,17 @@ final class PDFReaderViewController: UIViewController {
             }
         }
 
-        canvasView.drawing = PKDrawing()
-
-        if committed {
-            pdfView.setNeedsDisplay()
+        // Clear on the next runloop tick. Mutating PKCanvasView.drawing
+        // synchronously inside the delegate callback trips PencilKit's
+        // "Drawing count mismatch!" internal invariant (and corrupts
+        // subsequent strokes — the symptom we saw on hardware was that
+        // earlier annotations got dropped after a couple of strokes).
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.canvasView.drawing = PKDrawing()
+            if committed {
+                self.pdfView.setNeedsDisplay()
+            }
         }
     }
 
@@ -336,7 +339,9 @@ final class PDFReaderViewController: UIViewController {
 extension PDFReaderViewController: PKCanvasViewDelegate {
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         guard canvasView.tool is PKInkingTool else {
-            canvasView.drawing = PKDrawing()
+            DispatchQueue.main.async { [weak self] in
+                self?.canvasView.drawing = PKDrawing()
+            }
             return
         }
         commitStrokesAndClear()
