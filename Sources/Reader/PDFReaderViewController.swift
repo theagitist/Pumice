@@ -3,24 +3,54 @@ import PencilKit
 import PumiceCore
 import UIKit
 
+/// `PKCanvasView` subclass that supports an "Apple Pencil only" hit-test
+/// mode. In that mode the canvas claims a touch only when the current
+/// event contains an Apple Pencil touch — finger touches fall through to
+/// the view sitting underneath (PDFView's scroll gesture). In the
+/// default mode the canvas claims everything in its bounds, like a stock
+/// `PKCanvasView`.
+private final class ModalCanvasView: PKCanvasView {
+    /// When `true`, hit-test passes through any touch event that doesn't
+    /// contain an Apple Pencil touch.
+    var requirePencilForHit: Bool = false
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if requirePencilForHit {
+            guard let event,
+                  let touches = event.allTouches,
+                  touches.contains(where: { $0.type == .pencil })
+            else { return nil }
+        }
+        return super.hitTest(point, with: event)
+    }
+}
+
 /// Hosts a `PDFView` for browsing and a `PKCanvasView` overlay for
 /// annotation. Commits each completed stroke as a `/Subtype /Ink` (or
 /// `/Subtype /Highlight` when it snaps to text) on the underlying page via
-/// PumiceCore, then clears the canvas so PDFKit re-renders the committed
-/// annotation from the document itself.
+/// PumiceCore.
 ///
-/// Touch routing is explicit, mode-based — finger and pencil are treated
-/// uniformly within a given mode. The earlier "magical" attempt to route
-/// pencil to the canvas and finger to PDFView in the same mode broke on
-/// device (drawing-count-mismatch faults from PencilKit, plus PDFKit
-/// internal hit-test failures when we reparented the canvas inside
-/// `documentView`).
-///   * Scroll mode: `canvasView.isUserInteractionEnabled = false`. All
-///     touches pass through to `PDFView`, which scrolls / zooms / hits
-///     annotations.
-///   * Draw mode: canvas is interactive with `drawingPolicy = .anyInput`.
-///     Canvas claims everything; both finger and pencil draw. The user
-///     switches back to Scroll to navigate.
+/// Input modes (`PDFReaderController.fingerMode`):
+///   * Read: canvas is `userInteractionEnabled = false`. Every touch flows
+///     to PDFView — finger and pencil both scroll, annotation taps select.
+///   * Pencil: canvas is interactive with `drawingPolicy = .pencilOnly`
+///     and `requirePencilForHit = true`. Pencil touches are routed to the
+///     canvas for drawing; finger touches pass through the canvas to
+///     PDFView for scrolling. This is the PRD's headline UX.
+///   * Draw: canvas claims all touches with `drawingPolicy = .anyInput`.
+///     Both finger and pencil draw / snap to text; PDFView doesn't get
+///     touches and doesn't scroll.
+///
+/// Commit model: strokes are *not* removed from the canvas after they're
+/// committed to PDFKit. Doing that synchronously breaks PencilKit's
+/// internal stroke bookkeeping (drawing-count-mismatch faults, lost
+/// strokes), and doing it asynchronously races with the next stroke that
+/// the user may already be starting. Instead we track how many strokes
+/// have been committed (`committedStrokeCount`) and only convert the new
+/// ones each time `canvasViewDidEndUsingTool` fires. The committed strokes
+/// stay rendered by the canvas and are also rendered by PDFKit from their
+/// `/Ink` annotations underneath — visually the user just sees one stroke
+/// at each location.
 ///
 /// Editing toolbar (driven by `PDFReaderController`): undo / redo / delete
 /// the currently selected annotation. All mutations go through
@@ -32,10 +62,11 @@ import UIKit
 /// will replace the direct `PDFDocument.write`.
 final class PDFReaderViewController: UIViewController {
     private let pdfView = PDFView()
-    private let canvasView = PKCanvasView()
+    private let canvasView = ModalCanvasView()
     private let toolPicker = PKToolPicker()
     private var pdfURL: URL?
     private var needsSave = false
+    private var committedStrokeCount = 0
 
     private let _undoManager = UndoManager()
     private var selectedAnnotation: PDFAnnotation?
@@ -85,6 +116,12 @@ final class PDFReaderViewController: UIViewController {
         selectedAnnotationPage = nil
         controller?.refreshState()
 
+        // Reset the canvas. This is safe at load time because no stroke
+        // is in progress — `load` runs from the SwiftUI representable's
+        // make/update path, not from within PencilKit delegate callbacks.
+        canvasView.drawing = PKDrawing()
+        committedStrokeCount = 0
+
         guard let document = PDFDocument(url: url) else { return }
         pdfView.document = document
     }
@@ -100,8 +137,14 @@ final class PDFReaderViewController: UIViewController {
         switch mode {
         case .scroll:
             canvasView.isUserInteractionEnabled = false
+        case .pencil:
+            canvasView.isUserInteractionEnabled = true
+            canvasView.requirePencilForHit = true
+            canvasView.drawingPolicy = .pencilOnly
         case .draw:
             canvasView.isUserInteractionEnabled = true
+            canvasView.requirePencilForHit = false
+            canvasView.drawingPolicy = .anyInput
         }
         updateToolPickerVisibility()
     }
@@ -204,7 +247,7 @@ final class PDFReaderViewController: UIViewController {
         canvasView.minimumZoomScale = 1
         canvasView.maximumZoomScale = 1
         canvasView.delegate = self
-        canvasView.isUserInteractionEnabled = false // Scroll is the default.
+        canvasView.isUserInteractionEnabled = false // Read is the default.
         view.addSubview(canvasView)
 
         NSLayoutConstraint.activate([
@@ -217,30 +260,21 @@ final class PDFReaderViewController: UIViewController {
 
     // MARK: - Stroke commit
 
-    private func commitStrokesAndClear() {
+    private func commitNewStrokes() {
         guard let document = pdfView.document else { return }
+        let allStrokes = canvasView.drawing.strokes
+        // The user might have used the eraser or lasso (whose tool-end
+        // callbacks also reach us here). Re-syncing the counter to the
+        // current stroke count covers all of "ink added", "strokes erased",
+        // and "no change".
+        defer { committedStrokeCount = allStrokes.count }
 
-        let strokes = canvasView.drawing.strokes
-        guard !strokes.isEmpty else { return }
+        guard canvasView.tool is PKInkingTool,
+              allStrokes.count > committedStrokeCount else { return }
 
-        var committed = false
-        for pkStroke in strokes {
-            if commit(pkStroke: pkStroke, document: document) {
-                committed = true
-            }
-        }
-
-        // Clear on the next runloop tick. Mutating `PKCanvasView.drawing`
-        // synchronously inside the delegate callback trips PencilKit's
-        // "Drawing count mismatch!" internal invariant (the symptom on
-        // hardware was earlier annotations being dropped after a couple
-        // of strokes).
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.canvasView.drawing = PKDrawing()
-            if committed {
-                self.pdfView.setNeedsDisplay()
-            }
+        let newStrokes = Array(allStrokes.dropFirst(committedStrokeCount))
+        for pkStroke in newStrokes {
+            _ = commit(pkStroke: pkStroke, document: document)
         }
     }
 
@@ -329,12 +363,6 @@ final class PDFReaderViewController: UIViewController {
 
 extension PDFReaderViewController: PKCanvasViewDelegate {
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-        guard canvasView.tool is PKInkingTool else {
-            DispatchQueue.main.async { [weak self] in
-                self?.canvasView.drawing = PKDrawing()
-            }
-            return
-        }
-        commitStrokesAndClear()
+        commitNewStrokes()
     }
 }

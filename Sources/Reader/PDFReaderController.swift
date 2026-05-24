@@ -1,12 +1,12 @@
 import Foundation
 
-/// The reader's current input mode. Applies uniformly to finger and
-/// Apple Pencil — switching modes is the explicit way to alternate
-/// between navigating and annotating. Earlier attempts to differentiate
-/// pencil vs finger automatically broke on real hardware (PencilKit
-/// drawing-count-mismatch faults, PDFKit hit-test hierarchy errors).
+/// The reader's current input mode. Three discrete modes so the user
+/// can switch between "just navigating", "annotating with the pencil
+/// while the finger still scrolls" (the PRD's headline UX), and "draw
+/// freely with finger or pencil".
 enum FingerInputMode: String, CaseIterable, Identifiable, Sendable {
     case scroll
+    case pencil
     case draw
 
     var id: String { rawValue }
@@ -14,14 +14,16 @@ enum FingerInputMode: String, CaseIterable, Identifiable, Sendable {
     var label: String {
         switch self {
         case .scroll: "Read"
-        case .draw: "Annotate"
+        case .pencil: "Pencil"
+        case .draw: "Draw"
         }
     }
 
     var systemImage: String {
         switch self {
         case .scroll: "book"
-        case .draw: "pencil.tip"
+        case .pencil: "applepencil"
+        case .draw: "scribble"
         }
     }
 }
