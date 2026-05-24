@@ -267,48 +267,75 @@ final class PDFReaderViewController: UIViewController {
     // MARK: - Stroke commit
 
     private func commitNewStrokes() {
-        guard let document = pdfView.document else { return }
+        guard let document = pdfView.document else {
+            print("[Pumice] commitNewStrokes: no document, bail")
+            return
+        }
         let allStrokes = canvasView.drawing.strokes
+        let toolName = String(describing: type(of: canvasView.tool))
+        print("[Pumice] commitNewStrokes: tool=\(toolName) strokes=\(allStrokes.count) committed=\(committedStrokeCount)")
+
         // The user might have used the eraser or lasso (whose tool-end
         // callbacks also reach us here). Re-syncing the counter to the
         // current stroke count covers all of "ink added", "strokes erased",
         // and "no change".
         defer { committedStrokeCount = allStrokes.count }
 
-        guard canvasView.tool is PKInkingTool,
-              allStrokes.count > committedStrokeCount else { return }
+        guard canvasView.tool is PKInkingTool else {
+            print("[Pumice] commitNewStrokes: tool is not PKInkingTool, skipping commit")
+            return
+        }
+        guard allStrokes.count > committedStrokeCount else {
+            print("[Pumice] commitNewStrokes: no new strokes since last commit")
+            return
+        }
 
         let newStrokes = Array(allStrokes.dropFirst(committedStrokeCount))
-        for pkStroke in newStrokes {
-            _ = commit(pkStroke: pkStroke, document: document)
+        for (i, pkStroke) in newStrokes.enumerated() {
+            let ok = commit(pkStroke: pkStroke, document: document)
+            print("[Pumice] commitNewStrokes: stroke[\(i)] committed=\(ok)")
         }
     }
 
-    /// Schedule a canvas clear 300 ms in the future. Cancelled by the
-    /// next `touchesBegan` if the user is mid-session; otherwise fires
-    /// after the pause and PDFKit's `/Ink`/`/Highlight` annotations
-    /// take over rendering — which then scroll with their pages instead
-    /// of floating over the static canvas.
+    /// Schedule a canvas clear in the future. Cancelled by the next
+    /// stroke if the user is mid-session; otherwise fires after the
+    /// pause and PDFKit's `/Ink`/`/Highlight` annotations take over
+    /// rendering — which then scroll with their pages instead of
+    /// floating over the static canvas.
+    ///
+    /// Delay temporarily bumped to 2 s while we diagnose the
+    /// "stroke vanishes right after pen lift" bug — long enough for the
+    /// user to visually verify whether the PDF annotation appears
+    /// underneath the live stroke before the clear happens.
     private func scheduleCanvasClear() {
         clearWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.clearCanvasIfIdle()
         }
         clearWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
     private func clearCanvasIfIdle() {
+        print("[Pumice] clearCanvasIfIdle: wiping canvas after delay")
         canvasView.drawing = PKDrawing()
         committedStrokeCount = 0
         refreshPDFViewRendering()
     }
 
     private func commit(pkStroke: PKStroke, document: PDFDocument) -> Bool {
+        // Convert via window coordinates instead of canvas→pdfView
+        // directly: PKCanvasView is a UIScrollView subclass and its
+        // bounds.origin == contentOffset, which can subtly shift the
+        // direct conversion. Window coords are unambiguous.
         let canvasBounds = pkStroke.renderBounds
         let canvasCenter = CGPoint(x: canvasBounds.midX, y: canvasBounds.midY)
-        let centerInPDFView = canvasView.convert(canvasCenter, to: pdfView)
+        let centerInWindow = canvasView.convert(canvasCenter, to: nil)
+        let centerInPDFView = pdfView.convert(centerInWindow, from: nil)
+        print("[Pumice] commit: canvasCenter=\(canvasCenter) inPDFView=\(centerInPDFView) canvasBounds.origin=\(canvasView.bounds.origin) pdfViewBounds=\(pdfView.bounds)")
+
         guard let page = pdfView.page(for: centerInPDFView, nearest: true) else {
+            print("[Pumice] commit: no page at center, bail")
             return false
         }
         let pageIndex = document.index(for: page)
@@ -318,7 +345,8 @@ final class PDFReaderViewController: UIViewController {
         var widthSum: CGFloat = 0
         var widthCount = 0
         for point in pkStroke.path {
-            let inPDFView = canvasView.convert(point.location, to: pdfView)
+            let inWindow = canvasView.convert(point.location, to: nil)
+            let inPDFView = pdfView.convert(inWindow, from: nil)
             let inPage = pdfView.convert(inPDFView, to: page)
             pagePoints.append(inPage)
             widthSum += (point.size.width + point.size.height) / 2
@@ -327,7 +355,10 @@ final class PDFReaderViewController: UIViewController {
         guard widthCount > 0,
               let first = pagePoints.first,
               let last = pagePoints.last
-        else { return false }
+        else {
+            print("[Pumice] commit: empty path, bail")
+            return false
+        }
         let width = widthSum / CGFloat(widthCount)
         let strokeColor = StrokeColor(uiColor: pkStroke.ink.color)
 
@@ -338,6 +369,7 @@ final class PDFReaderViewController: UIViewController {
             pageIndex: pageIndex,
             strokeColor: strokeColor
         ) {
+            print("[Pumice] commit: snap-to-text highlight, page=\(pageIndex) bounds=\(snapAnnotation.bounds)")
             addAnnotation(snapAnnotation, to: page)
             return true
         }
@@ -349,6 +381,7 @@ final class PDFReaderViewController: UIViewController {
             pageIndex: pageIndex,
             uuid: UUID()
         )
+        print("[Pumice] commit: ink annotation, page=\(pageIndex) bounds=\(inkAnnotation.bounds) width=\(width) first=\(first) last=\(last)")
         addAnnotation(inkAnnotation, to: page)
         return true
     }
