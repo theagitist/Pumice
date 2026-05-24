@@ -64,7 +64,9 @@ struct VaultBrowserView: View {
             Label(node.displayName, systemImage: "folder")
                 .selectionDisabled()
         case .pdf:
-            Label(node.displayName, systemImage: "doc.richtext")
+            NavigationLink(value: node.url) {
+                Label(node.displayName, systemImage: "doc.richtext")
+            }
         }
     }
 

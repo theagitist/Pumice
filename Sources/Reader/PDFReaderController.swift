@@ -75,6 +75,13 @@ extension PDFReaderController {
         viewController = vc
         vc.controller = self
         vc.applyFingerMode(fingerMode)
-        refreshState()
+        // `attach` is called from `make/updateUIViewController`, which runs
+        // mid-view-update. Mutating `@Published` state here would trigger
+        // SwiftUI's "publishing during view updates" fault and cause taps
+        // (selection, toolbar buttons) to be dropped on the next render
+        // pass. Defer the refresh to the next main-actor turn.
+        Task { @MainActor [weak self] in
+            self?.refreshState()
+        }
     }
 }
