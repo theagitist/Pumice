@@ -157,7 +157,7 @@ final class PDFReaderViewController: UIViewController {
             target.removeAnnotation(annotation, from: page)
         }
         controller?.refreshState()
-        refreshPDFViewRendering()
+        invalidatePageRendering(page)
     }
 
     func removeAnnotation(_ annotation: PDFAnnotation, from page: PDFPage) {
@@ -171,21 +171,19 @@ final class PDFReaderViewController: UIViewController {
             target.addAnnotation(annotation, to: page)
         }
         controller?.refreshState()
-        refreshPDFViewRendering()
+        invalidatePageRendering(page)
     }
 
-    /// Force PDFKit to re-render its visible pages after we've mutated
-    /// the annotation set. PDFKit caches per-page bitmaps in private
-    /// subviews of `documentView`; `layoutDocumentView()` alone doesn't
-    /// always invalidate those on iOS 26, so we also mark every page
-    /// subview as needing display. Without this, freshly-committed `/Ink`
-    /// or `/Highlight` annotations stay invisible until the user
-    /// scrolls or zooms — which then races with the canvas's idle clear
-    /// and produces the "stroke vanished" symptom.
-    private func refreshPDFViewRendering() {
+    /// Force PDFKit to invalidate its cached bitmap for `page` and
+    /// re-render with the current annotation list. The toggle of
+    /// `displaysAnnotations` is the cleanest known kick — PDFKit
+    /// observes the change and treats it as a render-affecting state
+    /// change, dropping the cached bitmap. `setNeedsDisplay` alone on
+    /// the page subview is not enough on iOS 26.
+    private func invalidatePageRendering(_ page: PDFPage) {
+        page.displaysAnnotations = false
+        page.displaysAnnotations = true
         pdfView.layoutDocumentView()
-        pdfView.setNeedsDisplay()
-        pdfView.documentView?.setNeedsDisplay()
         pdfView.documentView?.subviews.forEach { $0.setNeedsDisplay() }
     }
 
@@ -320,7 +318,16 @@ final class PDFReaderViewController: UIViewController {
         print("[Pumice] clearCanvasIfIdle: wiping canvas after delay")
         canvasView.drawing = PKDrawing()
         committedStrokeCount = 0
-        refreshPDFViewRendering()
+        if let doc = pdfView.document {
+            for i in 0..<doc.pageCount {
+                if let page = doc.page(at: i) {
+                    page.displaysAnnotations = false
+                    page.displaysAnnotations = true
+                }
+            }
+        }
+        pdfView.layoutDocumentView()
+        pdfView.documentView?.subviews.forEach { $0.setNeedsDisplay() }
     }
 
     private func commit(pkStroke: PKStroke, document: PDFDocument) -> Bool {
