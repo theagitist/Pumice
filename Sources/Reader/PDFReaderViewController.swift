@@ -184,6 +184,13 @@ final class PDFReaderViewController: UIViewController {
     /// The reloaded annotations have the appearance streams PDFKit
     /// needs to render, so the page subviews actually show them.
     ///
+    /// Preserves the user's scroll position and zoom by capturing the
+    /// visible page's index and the page-coords point currently at the
+    /// top-left of the viewport, then re-navigating to that same point
+    /// on the equivalent page in the reloaded document. `autoScales`
+    /// is briefly disabled so the document-set doesn't snap to a fit
+    /// scale.
+    ///
     /// Cost: undo stack resets because the old `PDFPage` and
     /// `PDFAnnotation` references no longer belong to the document.
     /// This is acceptable — undo is per-drawing-session, and the
@@ -194,7 +201,17 @@ final class PDFReaderViewController: UIViewController {
               let document = pdfView.document
         else { return }
         print("[Pumice] reloadDocumentInMemoryToRender: starting")
-        let savedDestination = pdfView.currentDestination
+
+        // Capture viewport state BEFORE swapping documents.
+        let visiblePage = pdfView.currentPage
+        let visiblePageIndex = visiblePage.map { document.index(for: $0) } ?? 0
+        let viewportTopLeftInPage: CGPoint? = visiblePage.map { page in
+            // Top-left of the PDFView, expressed in the visible page's coords.
+            pdfView.convert(CGPoint(x: pdfView.bounds.minX, y: pdfView.bounds.minY),
+                            to: page)
+        }
+        let savedScale = pdfView.scaleFactor
+
         guard let data = document.dataRepresentation() else {
             print("[Pumice] reloadDocumentInMemoryToRender: dataRepresentation failed")
             return
@@ -203,21 +220,42 @@ final class PDFReaderViewController: UIViewController {
             print("[Pumice] reloadDocumentInMemoryToRender: PDFDocument(data:) failed")
             return
         }
+
+        // Disable autoScales briefly so PDFView doesn't snap to a fit
+        // scale when we swap documents.
+        pdfView.autoScales = false
         pdfView.document = reloaded
-        if let dest = savedDestination, let page = reloaded.page(at: 0) {
-            // currentDestination's page belongs to the old document; rebind
-            // to the same coords on the corresponding page in the reload.
-            let pageIndex = document.index(for: dest.page ?? page)
-            if let newPage = reloaded.page(at: pageIndex) {
-                pdfView.go(to: PDFDestination(page: newPage, at: dest.point))
+        pdfView.scaleFactor = savedScale
+
+        if visiblePageIndex < reloaded.pageCount,
+           let newPage = reloaded.page(at: visiblePageIndex),
+           let topLeft = viewportTopLeftInPage {
+            pdfView.go(to: PDFDestination(page: newPage, at: topLeft))
+        }
+        // Leave autoScales off — re-enabling here would immediately
+        // re-fit and undo the navigation we just did.
+
+        // Log how many of our annotations actually round-tripped.
+        var totalInk = 0
+        var totalHighlight = 0
+        for i in 0..<reloaded.pageCount {
+            if let p = reloaded.page(at: i) {
+                for a in p.annotations {
+                    switch a.type {
+                    case "Ink": totalInk += 1
+                    case "Highlight": totalHighlight += 1
+                    default: break
+                    }
+                }
             }
         }
+        print("[Pumice] reloadDocumentInMemoryToRender: done, \(data.count) bytes, post-reload counts ink=\(totalInk) highlight=\(totalHighlight)")
+
         _undoManager.removeAllActions()
         selectedAnnotation = nil
         selectedAnnotationPage = nil
         controller?.refreshState()
         pendingAnnotationsSinceLastRender = false
-        print("[Pumice] reloadDocumentInMemoryToRender: done, \(data.count) bytes roundtripped")
     }
 
     func deleteSelectedAnnotation() {
@@ -397,13 +435,21 @@ final class PDFReaderViewController: UIViewController {
         let width = widthSum / CGFloat(widthCount)
         let strokeColor = StrokeColor(uiColor: pkStroke.ink.color)
 
-        if let snapAnnotation = Self.buildSnapAnnotation(
-            firstPagePoint: first,
-            lastPagePoint: last,
-            on: page,
-            pageIndex: pageIndex,
-            strokeColor: strokeColor
-        ) {
+        // Only attempt snap-to-text when the gesture is clearly
+        // horizontal — a highlight is a swipe along a line, not a
+        // vertical scribble or a tight curl. Without this filter
+        // PDFKit's `selection(from:to:)` happily returns text that
+        // sits between any two arbitrary page points, so margin
+        // doodles end up converted to single-line highlights at the
+        // nearest text row.
+        if isHorizontalDominant(pagePoints: pagePoints),
+           let snapAnnotation = Self.buildSnapAnnotation(
+               firstPagePoint: first,
+               lastPagePoint: last,
+               on: page,
+               pageIndex: pageIndex,
+               strokeColor: strokeColor
+           ) {
             print("[Pumice] commit: snap-to-text highlight, page=\(pageIndex) bounds=\(snapAnnotation.bounds)")
             addAnnotation(snapAnnotation, to: page)
             return true
@@ -419,6 +465,31 @@ final class PDFReaderViewController: UIViewController {
         print("[Pumice] commit: ink annotation, page=\(pageIndex) bounds=\(inkAnnotation.bounds) width=\(width) first=\(first) last=\(last)")
         addAnnotation(inkAnnotation, to: page)
         return true
+    }
+
+    /// Returns true when the gesture is wide enough and shallow enough
+    /// to plausibly be a highlight swipe across a single text line.
+    /// Threshold: bounding-box width must be ≥ 2× height AND at least
+    /// 30 pt wide. Empirically rejects vertical scribbles, tight curls,
+    /// and tiny dots while accepting normal "underline this phrase"
+    /// motions.
+    private func isHorizontalDominant(pagePoints: [CGPoint]) -> Bool {
+        guard pagePoints.count >= 2 else { return false }
+        var minX = pagePoints[0].x
+        var maxX = pagePoints[0].x
+        var minY = pagePoints[0].y
+        var maxY = pagePoints[0].y
+        for p in pagePoints.dropFirst() {
+            minX = min(minX, p.x); maxX = max(maxX, p.x)
+            minY = min(minY, p.y); maxY = max(maxY, p.y)
+        }
+        let width = maxX - minX
+        let height = maxY - minY
+        let horizontal = width >= max(30, height * 2)
+        if !horizontal {
+            print("[Pumice] snap rejected: width=\(width) height=\(height) (not horizontal-dominant)")
+        }
+        return horizontal
     }
 
     /// Pure builder for snap-to-text highlights: resolves the gesture's
