@@ -3,17 +3,14 @@ import PencilKit
 import PumiceCore
 import UIKit
 
-/// `PKCanvasView` subclass that supports an "Apple Pencil only" hit-test
-/// mode and exposes a touch-start callback the host uses to cancel
-/// pending canvas-clear work.
+/// `PKCanvasView` subclass with an "Apple Pencil only" hit-test mode.
 ///
-/// Hit-test mode: when `requirePencilForHit == true`, the canvas claims a
-/// touch only when the current event contains an Apple Pencil touch —
-/// finger touches fall through to the view underneath (PDFView's scroll
-/// gesture). Otherwise the canvas claims everything in its bounds.
+/// When `requirePencilForHit == true`, the canvas claims a touch only when
+/// the current event contains an Apple Pencil touch — finger touches fall
+/// through to the view underneath (PDFView's scroll gesture). Otherwise
+/// the canvas claims everything in its bounds.
 private final class ModalCanvasView: PKCanvasView {
     var requirePencilForHit: Bool = false
-    var onTouchStarted: (() -> Void)?
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if requirePencilForHit {
@@ -23,11 +20,6 @@ private final class ModalCanvasView: PKCanvasView {
             else { return nil }
         }
         return super.hitTest(point, with: event)
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        onTouchStarted?()
-        super.touchesBegan(touches, with: event)
     }
 }
 
@@ -176,6 +168,12 @@ final class PDFReaderViewController: UIViewController {
             target.removeAnnotation(annotation, from: page)
         }
         controller?.refreshState()
+        // PDFKit caches per-page rendered bitmaps. Calling
+        // `page.addAnnotation` updates the model but doesn't always
+        // invalidate the cache, so the newly-added annotation might not
+        // appear until the user scrolls or zooms. `layoutDocumentView`
+        // forces a full re-layout that re-renders the affected page.
+        pdfView.layoutDocumentView()
     }
 
     func removeAnnotation(_ annotation: PDFAnnotation, from page: PDFPage) {
@@ -189,6 +187,7 @@ final class PDFReaderViewController: UIViewController {
             target.addAnnotation(annotation, to: page)
         }
         controller?.refreshState()
+        pdfView.layoutDocumentView()
     }
 
     func deleteSelectedAnnotation() {
@@ -256,12 +255,6 @@ final class PDFReaderViewController: UIViewController {
         canvasView.minimumZoomScale = 1
         canvasView.maximumZoomScale = 1
         canvasView.delegate = self
-        canvasView.onTouchStarted = { [weak self] in
-            // The user has begun a new stroke. Cancel any pending clear so
-            // PencilKit's drawing isn't yanked out from under them.
-            self?.clearWorkItem?.cancel()
-            self?.clearWorkItem = nil
-        }
         view.addSubview(canvasView)
 
         NSLayoutConstraint.activate([
@@ -396,6 +389,16 @@ final class PDFReaderViewController: UIViewController {
 }
 
 extension PDFReaderViewController: PKCanvasViewDelegate {
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        // The user has started a new stroke. Cancel any pending canvas
+        // clear so PencilKit's drawing isn't yanked out from under them.
+        // PencilKit routes drawing touches through its own gesture
+        // pipeline, so UIResponder's `touchesBegan` doesn't fire here —
+        // this delegate method is the reliable signal.
+        clearWorkItem?.cancel()
+        clearWorkItem = nil
+    }
+
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         commitNewStrokes()
         scheduleCanvasClear()
