@@ -32,7 +32,10 @@ enum FingerInputMode: String, CaseIterable, Identifiable, Sendable {
 /// state and forwards user actions to the underlying view controller.
 @MainActor
 final class PDFReaderController: ObservableObject {
-    @Published var fingerMode: FingerInputMode = .scroll {
+    // Default to Pencil mode so the PRD's headline UX — Apple Pencil draws,
+    // finger scrolls — works the moment the user opens a PDF, with no
+    // toolbar interaction required.
+    @Published var fingerMode: FingerInputMode = .pencil {
         didSet { viewController?.applyFingerMode(fingerMode) }
     }
     @Published private(set) var canUndo: Bool = false

@@ -22,6 +22,11 @@ struct VaultBrowserView: View {
                 readerController.saveIfNeeded()
             }
         }
+        .onChange(of: selection) { _, newSelection in
+            if let url = newSelection, url.pathExtension.lowercased() == "pdf" {
+                vault.rememberOpenedPDF(url)
+            }
+        }
     }
 
     private var sidebar: some View {
@@ -186,5 +191,12 @@ struct VaultBrowserView: View {
             VaultScanner.scan(rootURL: url)
         }.value
         scanResult = result
+
+        // After the tree is loaded, jump back to whatever PDF was open
+        // last session — but only if the user hasn't already picked
+        // something in this session.
+        if selection == nil, let restored = vault.resolveLastOpened() {
+            selection = restored
+        }
     }
 }

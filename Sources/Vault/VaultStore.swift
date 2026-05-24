@@ -5,8 +5,13 @@ import SwiftUI
 final class VaultStore: ObservableObject {
     @Published private(set) var resolvedURL: URL?
     @Published private(set) var status: Status = .idle
+    /// Path of the most recently opened PDF, relative to `resolvedURL`.
+    /// Persisted across app launches so the reader can restore the last
+    /// document automatically.
+    @Published private(set) var lastOpenedRelativePath: String?
 
     private let defaultsKey = "app.example.Pumice.vaultBookmark"
+    private let lastOpenedKey = "app.example.Pumice.lastOpenedPDF"
 
     enum Status: Equatable {
         case idle
@@ -37,6 +42,7 @@ final class VaultStore: ObservableObject {
             }
             resolvedURL = url
             status = .open
+            lastOpenedRelativePath = UserDefaults.standard.string(forKey: lastOpenedKey)
         } catch {
             UserDefaults.standard.removeObject(forKey: defaultsKey)
             status = .error(error.localizedDescription)
@@ -63,7 +69,37 @@ final class VaultStore: ObservableObject {
             url.stopAccessingSecurityScopedResource()
         }
         UserDefaults.standard.removeObject(forKey: defaultsKey)
+        UserDefaults.standard.removeObject(forKey: lastOpenedKey)
         resolvedURL = nil
+        lastOpenedRelativePath = nil
         status = .idle
+    }
+
+    /// Remember the PDF the user just opened so we can restore it on next
+    /// launch. `pdfURL` is stored as a path relative to the vault root; we
+    /// don't persist absolute URLs because the security-scoped bookmark
+    /// is for the vault, not individual files inside it.
+    func rememberOpenedPDF(_ pdfURL: URL) {
+        guard let vaultURL = resolvedURL else { return }
+        let vaultPath = vaultURL.standardizedFileURL.path
+        let pdfPath = pdfURL.standardizedFileURL.path
+        guard pdfPath.hasPrefix(vaultPath) else { return }
+        let relative = String(pdfPath.dropFirst(vaultPath.count)).drop(while: { $0 == "/" })
+        let relativeString = String(relative)
+        guard !relativeString.isEmpty else { return }
+        UserDefaults.standard.set(relativeString, forKey: lastOpenedKey)
+        lastOpenedRelativePath = relativeString
+    }
+
+    /// Resolve the last-opened relative path against the current vault.
+    /// Returns nil if no path is remembered or the file no longer exists.
+    func resolveLastOpened() -> URL? {
+        guard let vaultURL = resolvedURL,
+              let relative = lastOpenedRelativePath,
+              !relative.isEmpty
+        else { return nil }
+        let candidate = vaultURL.appendingPathComponent(relative)
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }
+        return candidate
     }
 }
