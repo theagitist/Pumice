@@ -130,12 +130,51 @@ struct VaultBrowserView: View {
                 .ignoresSafeArea(edges: .bottom)
                 .navigationTitle(url.deletingPathExtension().lastPathComponent)
                 .navigationBarTitleDisplayMode(.inline)
+                .toolbar { readerToolbar }
         } else {
             ContentUnavailableView(
                 "Pick a PDF",
                 systemImage: "doc.text",
-                description: Text("Browse folders on the left and tap a PDF to read it. Use your finger to scroll; touch your Apple Pencil to text to highlight, or to the margin to scribble.")
+                description: Text("Browse folders on the left and tap a PDF to read it. Tap an annotation to select it, then use the toolbar to delete or undo.")
             )
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var readerToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .topBarLeading) {
+            Picker("Finger", selection: $readerController.fingerMode) {
+                ForEach(FingerInputMode.allCases) { mode in
+                    Label(mode.label, systemImage: mode.systemImage).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .help("Choose what your finger does. Apple Pencil always draws and snaps to text.")
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                readerController.undo()
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+            }
+            .disabled(!readerController.canUndo)
+            .help("Undo")
+
+            Button {
+                readerController.redo()
+            } label: {
+                Image(systemName: "arrow.uturn.forward")
+            }
+            .disabled(!readerController.canRedo)
+            .help("Redo")
+
+            Button(role: .destructive) {
+                readerController.deleteSelectedAnnotation()
+            } label: {
+                Image(systemName: "trash")
+            }
+            .disabled(!readerController.hasSelectedAnnotation)
+            .help("Delete selected annotation")
         }
     }
 

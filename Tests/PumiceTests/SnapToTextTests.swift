@@ -30,14 +30,14 @@ struct SnapToTextTests {
         let from = CGPoint(x: textBounds.minX + 1, y: textBounds.midY)
         let to = CGPoint(x: textBounds.maxX - 1, y: textBounds.midY)
 
-        let added = PDFReaderViewController.trySnapToText(
+        let annotation = try #require(PDFReaderViewController.buildSnapAnnotation(
             firstPagePoint: from,
             lastPagePoint: to,
             on: page,
             pageIndex: 0,
             strokeColor: HighlightColor.yellow.rgba
-        )
-        #expect(added)
+        ))
+        page.addAnnotation(annotation)
 
         let highlights = page.annotations.filter { $0.type == "Highlight" }
         #expect(highlights.count == 1)
@@ -66,14 +66,14 @@ struct SnapToTextTests {
         let from = CGPoint(x: pageBounds.maxX - 10, y: pageBounds.minY + 5)
         let to = CGPoint(x: pageBounds.maxX - 5, y: pageBounds.minY + 1)
 
-        let added = PDFReaderViewController.trySnapToText(
+        let annotation = PDFReaderViewController.buildSnapAnnotation(
             firstPagePoint: from,
             lastPagePoint: to,
             on: page,
             pageIndex: 0,
             strokeColor: HighlightColor.yellow.rgba
         )
-        #expect(!added)
+        #expect(annotation == nil)
         #expect(page.annotations.isEmpty)
     }
 
@@ -88,14 +88,14 @@ struct SnapToTextTests {
         let to = CGPoint(x: textBounds.maxX - 1, y: textBounds.midY)
 
         let crimson = StrokeColor(red: 0.95, green: 0.10, blue: 0.10, alpha: 1.0)
-        let added = PDFReaderViewController.trySnapToText(
+        let annotation = try #require(PDFReaderViewController.buildSnapAnnotation(
             firstPagePoint: from,
             lastPagePoint: to,
             on: page,
             pageIndex: 0,
             strokeColor: crimson
-        )
-        #expect(added)
+        ))
+        page.addAnnotation(annotation)
 
         let highlight = try #require(page.annotations.first { $0.type == "Highlight" })
         // Annotation colour matches HighlightColor.red.rgba (not the input
