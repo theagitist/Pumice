@@ -14,7 +14,6 @@ Pumice.xcodeproj/
 .swiftpm/
 .build/
 Package.resolved
-Packages/
 
 # CocoaPods (not used, but defensive)
 Pods/

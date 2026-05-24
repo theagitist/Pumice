@@ -8,6 +8,10 @@ options:
   generateEmptyDirectories: true
   groupSortPosition: top
 
+packages:
+  PumiceCore:
+    path: Packages/PumiceCore
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -31,6 +35,8 @@ targets:
     resources:
       - path: App/Assets.xcassets
         optional: true
+    dependencies:
+      - package: PumiceCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.example.Pumice
