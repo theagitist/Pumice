@@ -53,6 +53,7 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesMoved(touches, with: event)
+        print("[Pumice] gesture touchesMoved count=\(touches.count) types=\(touches.map { $0.type.rawValue }) currentPath=\(currentPath != nil)")
         guard let path = currentPath,
               let touch = touches.first,
               touch.type == .pencil
@@ -64,6 +65,7 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesEnded(touches, with: event)
+        print("[Pumice] gesture touchesEnded count=\(touches.count) types=\(touches.map { $0.type.rawValue })")
         guard let path = currentPath,
               let touch = touches.first,
               touch.type == .pencil
@@ -79,6 +81,7 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesCancelled(touches, with: event)
+        print("[Pumice] gesture touchesCancelled count=\(touches.count)")
         currentPath = nil
         state = .cancelled
     }
