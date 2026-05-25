@@ -2,6 +2,12 @@ import PDFKit
 import PumiceCore
 import UIKit
 
+/// PDFPage subclass returned by `PDFDocumentDelegate.classForPage()`.
+/// Cookiezby's working `PDFPageOverlayViewProvider` reference uses a
+/// custom subclass; we mirror that pattern in case PDFKit requires
+/// it (currently empty, just a marker class).
+final class PumicePDFPage: PDFPage {}
+
 /// PDFView host that uses Apple's `PDFPageOverlayViewProvider` (iOS 16+)
 /// to install a `PumiceCanvasView` per PDF page. Each canvas owns its
 /// own stroke list (in canvas coords, UIKit Y-down). PDFKit auto-sizes
@@ -79,15 +85,17 @@ final class PDFReaderViewController: UIViewController {
         controller?.refreshState()
 
         guard let document = PDFDocument(url: url) else { return }
+        // Wire the document delegate BEFORE assigning to PDFView so
+        // PDFKit uses our custom PDFPage subclass from the very first
+        // page-load. The working Cookiezby reference uses this pattern
+        // and we mirror it in case PDFKit only invokes the overlay
+        // provider for documents whose pages are a custom subclass.
+        document.delegate = self
         pdfView.document = document
 
-        // Enable the overlay AFTER setting the document. The
-        // Cookiezby working reference does this order; setting these
-        // before the document is loaded results in PDFKit silently
-        // ignoring the provider.
         pdfView.pageOverlayViewProvider = self
         pdfView.isInMarkupMode = true
-        print("[Pumice] load: enabled provider+markup AFTER document set; markup=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil)")
+        print("[Pumice] load: doc.delegate set, markup=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil) pages=\(document.pageCount)")
 
         // Hydrate per-page paths from any /Ink annotations already in
         // the file. We strip them from the model so they don't double-
@@ -272,6 +280,12 @@ final class PDFReaderViewController: UIViewController {
             attachedNote: nil
         )
         return HighlightAnnotationBuilder.makeAnnotation(highlight: highlight, uuid: UUID())
+    }
+}
+
+extension PDFReaderViewController: @preconcurrency PDFDocumentDelegate {
+    func classForPage() -> AnyClass {
+        return PumicePDFPage.self
     }
 }
 
