@@ -63,7 +63,6 @@ final class PDFReaderViewController: UIViewController {
     private let _undoManager = UndoManager()
     private var selectedAnnotation: PDFAnnotation?
     private var selectedAnnotationPage: PDFPage?
-    private var allowFingerDrawing = false
 
     weak var controller: PDFReaderController?
 
@@ -146,14 +145,6 @@ final class PDFReaderViewController: UIViewController {
         }
     }
 
-    func applyAllowFingerDrawing(_ allow: Bool) {
-        allowFingerDrawing = allow
-        let policy: PKCanvasViewDrawingPolicy = allow ? .anyInput : .pencilOnly
-        for canvas in canvasByPage.values {
-            canvas.drawingPolicy = policy
-            canvas.requirePencilForHit = !allow
-        }
-    }
 
     // MARK: - Annotation toolbar actions
 
@@ -326,8 +317,8 @@ extension PDFReaderViewController: @preconcurrency PDFPageOverlayViewProvider {
         let canvas = ModalCanvasView()
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
-        canvas.drawingPolicy = allowFingerDrawing ? .anyInput : .pencilOnly
-        canvas.requirePencilForHit = !allowFingerDrawing
+        canvas.drawingPolicy = .pencilOnly
+        canvas.requirePencilForHit = true
         canvas.isScrollEnabled = false
         canvas.delegate = self
         canvas.tool = PKInkingTool(.pen, color: .label, width: 2)
@@ -335,6 +326,22 @@ extension PDFReaderViewController: @preconcurrency PDFPageOverlayViewProvider {
             canvas.drawing = drawing
         }
         canvasByPage[page] = canvas
+
+        // PDFKit's internal `PDFPageView` defaults to
+        // `isUserInteractionEnabled = false`, which silently blocks
+        // every touch from reaching our overlay. Setting `isInMarkupMode`
+        // and conforming to `PDFPageOverlayViewProvider` is not enough —
+        // we have to walk `documentView.subviews` ourselves and enable
+        // interaction on each PDFPageView. Without this the pen falls
+        // through to PDFView's scroll gesture and PencilKit never sees
+        // the touch. Workaround documented in the only working open-
+        // source reference for this API (Cookiezby/ios-pdf-edit-example)
+        // and confirmed nowhere in Apple's documentation.
+        for subview in view.documentView?.subviews ?? [] {
+            if NSStringFromClass(type(of: subview)) == "PDFPageView" {
+                subview.isUserInteractionEnabled = true
+            }
+        }
         print("[Pumice] overlay created for page \(view.document?.index(for: page) ?? -1)")
         return canvas
     }

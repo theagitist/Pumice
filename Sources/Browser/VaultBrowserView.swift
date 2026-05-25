@@ -150,15 +150,6 @@ struct VaultBrowserView: View {
 
     @ToolbarContentBuilder
     private var readerToolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            Toggle(isOn: $readerController.allowFingerDrawing) {
-                Image(systemName: readerController.allowFingerDrawing
-                      ? "hand.draw.fill"
-                      : "hand.draw")
-            }
-            .toggleStyle(.button)
-            .help("Off: pencil draws, finger scrolls. On: finger draws too (for when you don't have a Pencil).")
-        }
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
                 readerController.undo()
