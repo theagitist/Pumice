@@ -28,6 +28,101 @@ final class PumicePDFDocumentDelegate: NSObject, @unchecked Sendable, PDFDocumen
     }
 }
 
+/// Standalone `PDFPageOverlayViewProvider`. Same motivation as
+/// `PumicePDFDocumentDelegate`: PDFKit may invoke the provider's
+/// methods from a non-main queue, and a `@MainActor` view controller
+/// would silently get its calls dropped (or trip a concurrency
+/// assert). The working Cookiezby reference uses a separate provider
+/// object too; we mirror that pattern.
+///
+/// The provider owns the per-page canvas/path state. The view
+/// controller pulls from it on save and pushes hydrated paths into
+/// it on load.
+final class PumiceOverlayProvider: NSObject, @unchecked Sendable {
+    private let lock = NSLock()
+    private var pathsForPage: [PDFPage: [UIBezierPath]] = [:]
+    private var canvasByPage: [PDFPage: PumiceCanvasView] = [:]
+
+    /// Called whenever a new stroke is finished on any canvas. Runs
+    /// on the main queue (canvases live on main).
+    var onPathFinished: (@MainActor () -> Void)?
+
+    func setPaths(_ paths: [UIBezierPath], for page: PDFPage) {
+        lock.lock(); defer { lock.unlock() }
+        pathsForPage[page] = paths
+    }
+
+    func paths(for page: PDFPage) -> [UIBezierPath]? {
+        lock.lock(); defer { lock.unlock() }
+        return pathsForPage[page]
+    }
+
+    func allPaths() -> [PDFPage: [UIBezierPath]] {
+        lock.lock(); defer { lock.unlock() }
+        return pathsForPage
+    }
+
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        pathsForPage.removeAll()
+        canvasByPage.removeAll()
+    }
+
+    /// Sync any currently-active canvases' drawings back into the
+    /// path store. Call from save() before writing the document, to
+    /// capture drawings on pages that haven't scrolled out of view.
+    @MainActor func syncActiveCanvases() {
+        lock.lock(); defer { lock.unlock() }
+        for (page, canvas) in canvasByPage {
+            pathsForPage[page] = canvas.paths
+        }
+    }
+}
+
+extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
+    @MainActor
+    func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> UIView? {
+        print("[Pumice] (provider) overlayViewFor page=\(view.document?.index(for: page) ?? -1)")
+        let canvas = PumiceCanvasView()
+        let existing: [UIBezierPath]? = {
+            lock.lock(); defer { lock.unlock() }
+            return pathsForPage[page]
+        }()
+        if let existing { canvas.setPaths(existing) }
+        canvas.onPathFinished = { [weak self, weak page] _ in
+            guard let self, let page else { return }
+            self.lock.lock()
+            self.pathsForPage[page] = canvas.paths
+            self.lock.unlock()
+            DispatchQueue.main.async { [weak self] in
+                self?.onPathFinished?()
+            }
+        }
+        lock.lock()
+        canvasByPage[page] = canvas
+        lock.unlock()
+
+        // Same PDFPageView.userInteractionEnabled trick as before;
+        // the overlay won't see touches without it.
+        for subview in view.documentView?.subviews ?? [] {
+            if NSStringFromClass(type(of: subview)) == "PDFPageView" {
+                subview.isUserInteractionEnabled = true
+            }
+        }
+        return canvas
+    }
+
+    @MainActor
+    func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
+        guard let canvas = overlayView as? PumiceCanvasView else { return }
+        print("[Pumice] (provider) willEnd page=\(pdfView.document?.index(for: page) ?? -1) strokes=\(canvas.paths.count)")
+        lock.lock()
+        pathsForPage[page] = canvas.paths
+        canvasByPage.removeValue(forKey: page)
+        lock.unlock()
+    }
+}
+
 /// PDFView host that uses Apple's `PDFPageOverlayViewProvider` (iOS 16+)
 /// to install a `PumiceCanvasView` per PDF page. Each canvas owns its
 /// own stroke list (in canvas coords, UIKit Y-down). PDFKit auto-sizes
@@ -60,8 +155,7 @@ final class PDFReaderViewController: UIViewController {
     private var pdfURL: URL?
     private var needsSave = false
 
-    private var canvasByPage: [PDFPage: PumiceCanvasView] = [:]
-    private var pathsForPage: [PDFPage: [UIBezierPath]] = [:]
+    private let overlayProvider = PumiceOverlayProvider()
 
     private let _undoManager = UndoManager()
     private let documentDelegate = PumicePDFDocumentDelegate()
@@ -81,6 +175,17 @@ final class PDFReaderViewController: UIViewController {
         view.backgroundColor = .systemBackground
         configurePDFView()
 
+        // Wire the overlay provider BEFORE any document is loaded.
+        // Matches the working Cookiezby reference; setting it after
+        // pdfView.document had no effect in past iterations.
+        pdfView.pageOverlayViewProvider = overlayProvider
+        pdfView.isInMarkupMode = true
+        overlayProvider.onPathFinished = { [weak self] in
+            self?.needsSave = true
+            self?.controller?.refreshState()
+        }
+        print("[Pumice] viewDidLoad: provider wired (separate object), markup=\(pdfView.isInMarkupMode)")
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(annotationWasHit(_:)),
@@ -91,7 +196,7 @@ final class PDFReaderViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        syncActiveCanvases()
+        overlayProvider.syncActiveCanvases()
         saveIfNeeded()
     }
 
@@ -101,44 +206,18 @@ final class PDFReaderViewController: UIViewController {
         _undoManager.removeAllActions()
         selectedAnnotation = nil
         selectedAnnotationPage = nil
-        canvasByPage.removeAll()
-        pathsForPage.removeAll()
+        overlayProvider.reset()
         controller?.refreshState()
 
         guard let document = PDFDocument(url: url) else { return }
-        // Wire the document delegate BEFORE assigning to PDFView so
-        // PDFKit uses our custom PDFPage subclass from the very first
-        // page-load. The delegate is a separate, non-MainActor type:
-        // PDFKit invokes classForPage() from background queues during
-        // parsing, which triggers Swift 6's MainActor concurrency
-        // assert if the delegate is on a UIViewController (which is
-        // implicitly @MainActor).
         document.delegate = documentDelegate
         pdfView.document = document
-
-        pdfView.pageOverlayViewProvider = self
-        pdfView.isInMarkupMode = true
-
-        // DIAGNOSTIC: disable PDFView's internal scroll. Cookiezby's
-        // working reference does this; their app has explicit
-        // start/end-edit modes that toggle it. We want to find out
-        // whether scroll-enabled is what's blocking overlayViewFor:
-        // from being called at all. If overlays start appearing with
-        // scroll off, we know the gesture priority is the blocker and
-        // can design a real fix. If overlays still don't appear with
-        // scroll off, the cause is elsewhere.
-        pdfView.privateScrollView?.isScrollEnabled = false
-        print("[Pumice] load: doc.delegate set, markup=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil) pages=\(document.pageCount) innerScrollEnabled=\(pdfView.privateScrollView?.isScrollEnabled ?? true)")
-
-        // Nudge PDFView into a layout pass — overlayViewFor: is only
-        // queried when a page actually has to be laid out, and an
-        // off-screen pre-load might not count.
-        pdfView.setNeedsLayout()
-        pdfView.layoutIfNeeded()
+        print("[Pumice] load: pages=\(document.pageCount) markup=\(pdfView.isInMarkupMode) providerKind=\(type(of: pdfView.pageOverlayViewProvider!))")
 
         // Hydrate per-page paths from any /Ink annotations already in
         // the file. We strip them from the model so they don't double-
         // up with what the canvas renders.
+        var hydratedPages = 0
         for i in 0..<document.pageCount {
             guard let page = document.page(at: i) else { continue }
             let inkAnnotations = page.annotations.filter { $0.type == "Ink" }
@@ -150,19 +229,21 @@ final class PDFReaderViewController: UIViewController {
                 }
             }
             if !canvasPaths.isEmpty {
-                pathsForPage[page] = canvasPaths
+                overlayProvider.setPaths(canvasPaths, for: page)
+                hydratedPages += 1
             }
             for ann in inkAnnotations {
                 page.removeAnnotation(ann)
             }
         }
-        print("[Pumice] load: \(pathsForPage.count) pages with prior strokes")
+        print("[Pumice] load: \(hydratedPages) pages with prior strokes")
     }
 
     func saveIfNeeded() {
         guard needsSave, let url = pdfURL, let document = pdfView.document else { return }
-        syncActiveCanvases()
-        for (page, paths) in pathsForPage {
+        overlayProvider.syncActiveCanvases()
+        let snapshot = overlayProvider.allPaths()
+        for (page, paths) in snapshot {
             for ann in page.annotations where ann.type == "Ink" {
                 page.removeAnnotation(ann)
             }
@@ -179,7 +260,7 @@ final class PDFReaderViewController: UIViewController {
         }
         if document.write(to: url) {
             needsSave = false
-            print("[Pumice] save: wrote \(pathsForPage.count) page-strokes to \(url.lastPathComponent)")
+            print("[Pumice] save: wrote \(snapshot.count) page-strokes to \(url.lastPathComponent)")
         }
     }
 
@@ -220,12 +301,6 @@ final class PDFReaderViewController: UIViewController {
     }
 
     // MARK: - Plumbing
-
-    private func syncActiveCanvases() {
-        for (page, canvas) in canvasByPage {
-            pathsForPage[page] = canvas.paths
-        }
-    }
 
     private func configurePDFView() {
         pdfView.translatesAutoresizingMaskIntoConstraints = false
@@ -322,39 +397,3 @@ final class PDFReaderViewController: UIViewController {
     }
 }
 
-extension PDFReaderViewController: @preconcurrency PDFPageOverlayViewProvider {
-    func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> UIView? {
-        let canvas = PumiceCanvasView()
-        if let paths = pathsForPage[page] {
-            canvas.setPaths(paths)
-        }
-        canvas.onPathFinished = { [weak self, weak page] _ in
-            guard let self, let page else { return }
-            self.pathsForPage[page] = self.canvasByPage[page]?.paths
-            self.needsSave = true
-            self.controller?.refreshState()
-        }
-        canvasByPage[page] = canvas
-
-        // PDFKit's internal `PDFPageView` (per-page subview inside
-        // documentView) defaults to isUserInteractionEnabled = false,
-        // so without this every touch to our overlay is silently
-        // swallowed by the parent. Class lookup is by name because
-        // the symbol isn't public. Workaround documented in
-        // Cookiezby/ios-pdf-edit-example; nowhere in Apple's docs.
-        for subview in view.documentView?.subviews ?? [] {
-            if NSStringFromClass(type(of: subview)) == "PDFPageView" {
-                subview.isUserInteractionEnabled = true
-            }
-        }
-        print("[Pumice] overlay created for page \(view.document?.index(for: page) ?? -1)")
-        return canvas
-    }
-
-    func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
-        guard let canvas = overlayView as? PumiceCanvasView else { return }
-        pathsForPage[page] = canvas.paths
-        canvasByPage.removeValue(forKey: page)
-        print("[Pumice] overlay released for page \(pdfView.document?.index(for: page) ?? -1), strokes=\(canvas.paths.count)")
-    }
-}
