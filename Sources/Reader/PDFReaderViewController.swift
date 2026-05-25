@@ -345,7 +345,24 @@ final class PDFReaderViewController: UIViewController {
                 page.addAnnotation(annotation)
             }
         }
-        if document.write(to: url) {
+
+        // Wrap the write in NSFileCoordinator so file presenters
+        // observing this URL are notified atomically. Without this,
+        // sync daemons like Möbius Sync (Syncthing for iOS) and
+        // iCloud Drive can miss the change — the byte-level write
+        // happens, the file's mtime updates, but the daemons rely on
+        // file coordination to know which writer "owns" the change
+        // and when it's safe to read. The user saw scribbles persist
+        // locally (writes succeed) but never propagate to their
+        // Obsidian vault on other devices (Möbius's watcher never
+        // saw the write).
+        let coordinator = NSFileCoordinator()
+        var coordinationError: NSError?
+        var writeSucceeded = false
+        coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { coordinatedURL in
+            writeSucceeded = document.write(to: coordinatedURL)
+        }
+        if writeSucceeded {
             needsSave = false
         }
     }
