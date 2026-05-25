@@ -59,10 +59,16 @@ final class PumiceOverlayProvider: NSObject, @unchecked Sendable {
     /// controller can register an undo action for it.
     var onPathFinished: (@MainActor (PDFPage, StrokeRecord) -> Void)?
 
+    /// Called during an eraser gesture on every `touchesMoved`,
+    /// carrying the freshly-traversed segment in canvas coords. The
+    /// controller uses this to remove `/Highlight` annotations the
+    /// gesture crosses in real time.
+    var onEraserSegment: (@MainActor (PDFPage, CGPoint, CGPoint) -> Void)?
+
     /// Called when an eraser gesture finishes on a canvas, carrying
-    /// every stroke the gesture rubbed out. The canvas has already
-    /// removed them from its own state; the provider mirrors that into
-    /// `strokesForPage` and the controller registers the undo batch.
+    /// every stroke the gesture rubbed out. Highlights removed during
+    /// the gesture were already taken care of via `onEraserSegment`;
+    /// the controller pairs them into a single undo entry.
     var onEraserStroke: (@MainActor (PDFPage, [StrokeRecord]) -> Void)?
 
     /// Called when a highlighter gesture finishes on a canvas, carrying
@@ -195,6 +201,12 @@ extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
                 self?.onPathFinished?(page, stroke)
             }
         }
+        canvas.onEraserSegment = { [weak self, weak page] from, to in
+            guard let self, let page else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.onEraserSegment?(page, from, to)
+            }
+        }
         canvas.onEraserStroke = { [weak self, weak page] removedBatch in
             guard let self, let page else { return }
             // Canvas has already removed these strokes from its own
@@ -298,9 +310,13 @@ final class PDFReaderViewController: UIViewController {
             self.controller?.refreshState()
             self.scheduleDebouncedSave()
         }
+        overlayProvider.onEraserSegment = { [weak self] page, from, to in
+            guard let self else { return }
+            self.handleEraserSegment(from: from, to: to, on: page)
+        }
         overlayProvider.onEraserStroke = { [weak self] page, removedBatch in
             guard let self else { return }
-            self.handleEraserBatch(removed: removedBatch, on: page)
+            self.handleEraserSweep(removedStrokes: removedBatch, on: page)
             self.scheduleDebouncedSave()
         }
         overlayProvider.onHighlightStrokeFinished = { [weak self] page, first, last in
@@ -509,36 +525,155 @@ final class PDFReaderViewController: UIViewController {
 
     // MARK: - Eraser
 
+    /// Hit-test radius for both stroke and highlight erasing, in canvas
+    /// points. Mirrors `PumiceCanvasView.eraserRadius` so the two
+    /// erasers behave identically.
+    private static let eraserHitRadius: CGFloat = 12
+
+    /// Highlights removed by the current in-flight eraser gesture.
+    /// Built up per-segment by `handleEraserSegment` and consumed at
+    /// gesture-end by `handleEraserSweep`, where it's folded into a
+    /// single undo step alongside the canvas-removed strokes.
+    private var pendingErasedHighlights: [PDFAnnotation] = []
+
+    /// Called on every eraser `touchesMoved`. Removes any `/Highlight`
+    /// annotation the freshly-traversed segment crosses, in real time,
+    /// so the user sees highlights disappear under the eraser the same
+    /// way scribbled strokes do. The accumulated batch is finalised at
+    /// gesture-end by `handleEraserSweep`.
+    private func handleEraserSegment(from: CGPoint, to: CGPoint, on page: PDFPage) {
+        let pageHeight = page.bounds(for: .mediaBox).height
+        // Sample one probe per ~4pt of eraser travel — same density
+        // PumiceCanvasView uses for stroke hit-testing.
+        let dx = to.x - from.x
+        let dy = to.y - from.y
+        let distance = (dx * dx + dy * dy).squareRoot()
+        let steps = max(1, Int(distance / 4))
+        var samplesInPageSpace: [CGPoint] = []
+        samplesInPageSpace.reserveCapacity(steps + 1)
+        for step in 0...steps {
+            let t = CGFloat(step) / CGFloat(steps)
+            let cx = from.x + dx * t
+            let cy = from.y + dy * t
+            samplesInPageSpace.append(CGPoint(x: cx, y: pageHeight - cy))
+        }
+
+        var newlyRemoved: [PDFAnnotation] = []
+        for highlight in page.annotations where highlight.type == "Highlight" {
+            if Self.highlight(highlight, isHitBy: samplesInPageSpace, radius: Self.eraserHitRadius) {
+                page.removeAnnotation(highlight)
+                newlyRemoved.append(highlight)
+            }
+        }
+
+        guard !newlyRemoved.isEmpty else { return }
+        pendingErasedHighlights.append(contentsOf: newlyRemoved)
+        forcePDFPageRedraw()
+    }
+
+    /// Test whether `highlight`'s quads (expanded by `radius`) contain
+    /// any of the eraser sample points (in PDF user space).
+    private static func highlight(
+        _ highlight: PDFAnnotation,
+        isHitBy samplesInPageSpace: [CGPoint],
+        radius: CGFloat
+    ) -> Bool {
+        for rect in absoluteQuadRects(of: highlight) {
+            let expanded = rect.insetBy(dx: -radius, dy: -radius)
+            for sample in samplesInPageSpace where expanded.contains(sample) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Per-quad axis-aligned bounding rects of a markup annotation,
+    /// in absolute PDF user-space coordinates. `quadrilateralPoints`
+    /// are stored relative to `bounds.origin` per the PDFKit SDK
+    /// header (`PDFAnnotationUtilities.h`); this helper adds the
+    /// origin back to make the rects compatible with `PDFSelection`
+    /// bounds and other absolute-space geometry.
+    private static func absoluteQuadRects(of annotation: PDFAnnotation) -> [CGRect] {
+        let origin = annotation.bounds.origin
+        let quadPoints = annotation.quadrilateralPoints ?? []
+        var rects: [CGRect] = []
+        rects.reserveCapacity(quadPoints.count / 4)
+        var i = 0
+        while i + 3 < quadPoints.count {
+            let pts = (i...i+3).map { quadPoints[$0].cgPointValue }
+                .map { CGPoint(x: $0.x + origin.x, y: $0.y + origin.y) }
+            let xs = pts.map(\.x)
+            let ys = pts.map(\.y)
+            rects.append(CGRect(
+                x: xs.min() ?? 0,
+                y: ys.min() ?? 0,
+                width: (xs.max() ?? 0) - (xs.min() ?? 0),
+                height: (ys.max() ?? 0) - (ys.min() ?? 0)
+            ))
+            i += 4
+        }
+        return rects
+    }
+
     /// Called when the eraser gesture finishes on a page's canvas.
-    /// The canvas erased strokes in real-time as the gesture passed
-    /// over them; here we just register an undoable batch so a single
-    /// Undo restores all of them at once.
-    private func handleEraserBatch(removed: [StrokeRecord], on page: PDFPage) {
-        guard !removed.isEmpty else { return }
+    /// The canvas has already removed crossed strokes in real time,
+    /// and `handleEraserSegment` has already removed crossed highlights
+    /// in real time. This pairs the two batches into a single undo
+    /// step so one Undo restores everything the gesture rubbed out.
+    private func handleEraserSweep(removedStrokes: [StrokeRecord], on page: PDFPage) {
+        let removedHighlights = pendingErasedHighlights
+        pendingErasedHighlights.removeAll()
+
+        if removedStrokes.isEmpty && removedHighlights.isEmpty { return }
+
         _undoManager.registerUndo(withTarget: self) { target in
-            target.performUndoRestoreStrokes(removed, on: page)
+            target.performUndoRestoreEraserBatch(
+                strokes: removedStrokes,
+                highlights: removedHighlights,
+                on: page
+            )
         }
         needsSave = true
         controller?.refreshState()
     }
 
-    private func performUndoRestoreStrokes(_ strokes: [StrokeRecord], on page: PDFPage) {
+    private func performUndoRestoreEraserBatch(
+        strokes: [StrokeRecord],
+        highlights: [PDFAnnotation],
+        on page: PDFPage
+    ) {
         for stroke in strokes {
             overlayProvider.appendStroke(stroke, to: page)
         }
+        for highlight in highlights {
+            page.addAnnotation(highlight)
+        }
+        if !highlights.isEmpty {
+            forcePDFPageRedraw()
+        }
         _undoManager.registerUndo(withTarget: self) { target in
-            target.performRedoEraseStrokes(strokes, on: page)
+            target.performRedoEraseEraserBatch(strokes: strokes, highlights: highlights, on: page)
         }
         needsSave = true
         controller?.refreshState()
     }
 
-    private func performRedoEraseStrokes(_ strokes: [StrokeRecord], on page: PDFPage) {
+    private func performRedoEraseEraserBatch(
+        strokes: [StrokeRecord],
+        highlights: [PDFAnnotation],
+        on page: PDFPage
+    ) {
         for stroke in strokes {
             overlayProvider.removeStroke(stroke, from: page)
         }
+        for highlight in highlights {
+            page.removeAnnotation(highlight)
+        }
+        if !highlights.isEmpty {
+            forcePDFPageRedraw()
+        }
         _undoManager.registerUndo(withTarget: self) { target in
-            target.performUndoRestoreStrokes(strokes, on: page)
+            target.performUndoRestoreEraserBatch(strokes: strokes, highlights: highlights, on: page)
         }
         needsSave = true
         controller?.refreshState()
@@ -567,6 +702,31 @@ final class PDFReaderViewController: UIViewController {
             pageIndex: pageIndex,
             strokeColor: strokeColor
         ) else { return }
+
+        // Don't stack highlights over already-highlighted text. We
+        // compare per-quad rather than per-bounds: a multi-line
+        // highlight's `.bounds` includes the gap between its lines,
+        // so a bounds-only check would reject new highlights that
+        // land on the gap (e.g. a single-line highlight on a line
+        // between two highlighted lines). Per-quad with a small
+        // overlap threshold rejects only genuine overlap.
+        let newRects = Self.absoluteQuadRects(of: annotation)
+        let existingHighlights = page.annotations.filter { $0.type == "Highlight" }
+        let overlaps = existingHighlights.contains { existing in
+            let existingRects = Self.absoluteQuadRects(of: existing)
+            for newRect in newRects {
+                for existingRect in existingRects {
+                    let inter = newRect.intersection(existingRect)
+                    // 0.5pt threshold ignores edge-touching adjacent
+                    // text lines and tiny floating-point fuzz.
+                    if inter.width > 0.5 && inter.height > 0.5 {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+        if overlaps { return }
 
         page.addAnnotation(annotation)
         // iOS 26 PDFKit caches each page's rendering in a PDFPageView

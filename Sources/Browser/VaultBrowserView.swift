@@ -217,16 +217,15 @@ struct VaultBrowserView: View {
         .accessibilityLabel("Tool picker")
     }
 
-    /// Color + width menu. The menu body always renders the SAME four
-    /// pickers (pen color, pen width, highlight color, highlight width)
-    /// regardless of active tool — conditional menu content collides
-    /// with the toolbar Menu's tap recognizer on iPad (visible in logs
-    /// as `updateVisibleMenuWithBlock while no context menu is
-    /// visible`).
+    /// Color + width menu. Contents are contextual to the currently
+    /// active tool — only the pen pickers when the pen is active,
+    /// only the highlighter pickers when the highlighter is active.
     ///
-    /// The menu label shows the swatch of the currently active tool's
-    /// selected color so the toolbar reflects what you'd be drawing
-    /// with. For eraser, falls back to a generic palette glyph.
+    /// The menu label shows the swatch of the active tool's selected
+    /// color so the toolbar reflects what you'd be drawing with. For
+    /// the eraser the menu has nothing to configure; the label dims
+    /// and the menu is hidden by the toolbar (the ToolbarItem is
+    /// gated on `activeTool != .eraser`).
     ///
     /// Asset-catalog images: SwiftUI Menu bridges Pickers to UIMenu,
     /// which only carries a title + UIImage per option — Shape views
@@ -234,9 +233,11 @@ struct VaultBrowserView: View {
     /// `Swatch*` PNGs are rendering-intent "original" so iOS doesn't
     /// tint them; the `Width*` PNGs are template-rendered so menu
     /// rows tint them to match the foreground color.
+    @ViewBuilder
     private var colorMenu: some View {
         Menu {
-            Section("Pen") {
+            switch readerController.activeTool {
+            case .pen:
                 Picker("Color", selection: $readerController.penColor) {
                     ForEach(PenColor.allCases) { color in
                         Label(color.displayName, image: color.swatchAssetName)
@@ -249,8 +250,7 @@ struct VaultBrowserView: View {
                             .tag(width)
                     }
                 }
-            }
-            Section("Highlighter") {
+            case .highlighter:
                 Picker("Color", selection: $readerController.highlightColor) {
                     ForEach(HighlightPenColor.allCases) { color in
                         Label(color.displayName, image: color.swatchAssetName)
@@ -263,6 +263,8 @@ struct VaultBrowserView: View {
                             .tag(width)
                     }
                 }
+            case .eraser:
+                EmptyView()
             }
         } label: {
             colorMenuLabel

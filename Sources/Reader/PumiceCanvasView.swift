@@ -72,10 +72,20 @@ final class PumiceCanvasView: UIView {
     /// Fired once at the end of a successful pen stroke (mode == .pen).
     var onPathFinished: ((StrokeRecord) -> Void)?
 
+    /// Fired during an eraser gesture (mode == .eraser) on every
+    /// `touchesMoved`, carrying the freshly-traversed segment in
+    /// canvas coords. The owning view controller uses this to remove
+    /// `/Highlight` annotations the gesture crosses *in real time* —
+    /// canvas strokes are erased here too, but they're rendered by
+    /// the canvas and disappear immediately. Highlights are rendered
+    /// by PDFKit on the page and need the VC to react per-segment.
+    var onEraserSegment: ((_ from: CGPoint, _ to: CGPoint) -> Void)?
+
     /// Fired once at the end of an eraser gesture (mode == .eraser),
-    /// carrying every stroke the gesture erased. Empty batches are
-    /// NOT reported — a gesture that hit nothing is a no-op.
-    var onEraserStroke: (([StrokeRecord]) -> Void)?
+    /// carrying every canvas stroke the gesture erased. The VC pairs
+    /// this with the highlights it removed via `onEraserSegment` into
+    /// a single undo step.
+    var onEraserStroke: ((_ removed: [StrokeRecord]) -> Void)?
 
     /// Fired once at the end of a successful highlighter stroke
     /// (mode == .highlighter). Carries the gesture's first and last
@@ -301,6 +311,7 @@ extension PumiceCanvasView: @preconcurrency PumicePencilGestureDelegate {
             showEraserCursor(at: currentPoint)
             let from = eraserLastPoint ?? currentPoint
             eraseAlong(from: from, to: currentPoint)
+            onEraserSegment?(from, currentPoint)
             eraserLastPoint = currentPoint
         }
     }
@@ -312,15 +323,21 @@ extension PumiceCanvasView: @preconcurrency PumicePencilGestureDelegate {
         case .eraser:
             // Finish the last segment with the gesture's actual end
             // point in case `touchesEnded` carried sub-touches the
-            // last `touchesMoved` didn't see.
+            // last `touchesMoved` didn't see. Mirror the per-segment
+            // callback so the VC sees the closing slice for highlight
+            // hit-tests too.
             if let from = eraserLastPoint {
                 eraseAlong(from: from, to: path.currentPoint)
+                onEraserSegment?(from, path.currentPoint)
             }
             hideEraserCursor()
             let batch = erasedDuringGesture
             erasedDuringGesture.removeAll()
             eraserLastPoint = nil
-            if !batch.isEmpty { onEraserStroke?(batch) }
+            // Fire even on an empty stroke batch — highlights removed
+            // via `onEraserSegment` may still need to be folded into
+            // an undo step at gesture-end.
+            onEraserStroke?(batch)
 
         case .highlighter:
             let first = highlightFirstPoint ?? path.cgPath.firstPoint ?? path.currentPoint
