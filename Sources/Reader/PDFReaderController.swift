@@ -17,23 +17,18 @@ final class PDFReaderController: ObservableObject {
     /// resume drawing, not to configure the pen for later.
     @Published var penColor: PenColor = .blue {
         didSet {
-            viewController?.saveIfNeeded()
             viewController?.setPenColor(penColor.uiColor)
             if isEraserActive { isEraserActive = false }
         }
     }
     @Published var penWidth: PenWidth = .medium {
         didSet {
-            viewController?.saveIfNeeded()
             viewController?.setPenWidth(penWidth.points)
             if isEraserActive { isEraserActive = false }
         }
     }
     @Published var isEraserActive: Bool = false {
-        didSet {
-            viewController?.saveIfNeeded()
-            viewController?.setEraserActive(isEraserActive)
-        }
+        didSet { viewController?.setEraserActive(isEraserActive) }
     }
 
     weak var viewController: PDFReaderViewController?
