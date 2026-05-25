@@ -33,13 +33,11 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesBegan(touches, with: event)
-        print("[Pumice] gesture touchesBegan count=\(touches.count) types=\(touches.map { $0.type.rawValue })")
         guard let touch = touches.first,
               touch.type == .pencil,
               event.allTouches?.count == 1
         else {
             state = .failed
-            print("[Pumice] gesture failed (not pencil or multi-touch)")
             return
         }
         let path = UIBezierPath()
@@ -48,24 +46,29 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
         path.move(to: touch.location(in: view))
         currentPath = path
         state = .began
-        print("[Pumice] gesture began at \(touch.location(in: view))")
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesMoved(touches, with: event)
-        print("[Pumice] gesture touchesMoved count=\(touches.count) types=\(touches.map { $0.type.rawValue }) currentPath=\(currentPath != nil)")
         guard let path = currentPath,
               let touch = touches.first,
               touch.type == .pencil
         else { return }
-        path.addLine(to: touch.location(in: view))
+        // Use UIEvent.coalescedTouches to pull every sub-touch event
+        // the system collected since the last call. Apple Pencil 2/Pro
+        // emits up to ~240Hz of touch samples, but UIKit batches them
+        // into one touchesMoved call per refresh — without coalescing
+        // we'd drop most of them and the resulting path is jagged at
+        // anything above a slow pen speed.
+        for sub in event.coalescedTouches(for: touch) ?? [touch] {
+            path.addLine(to: sub.location(in: view))
+        }
         pencilDelegate?.pencilGestureDidUpdate(path: path)
         state = .changed
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesEnded(touches, with: event)
-        print("[Pumice] gesture touchesEnded count=\(touches.count) types=\(touches.map { $0.type.rawValue })")
         guard let path = currentPath,
               let touch = touches.first,
               touch.type == .pencil
@@ -73,7 +76,9 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
             state = .ended
             return
         }
-        path.addLine(to: touch.location(in: view))
+        for sub in event.coalescedTouches(for: touch) ?? [touch] {
+            path.addLine(to: sub.location(in: view))
+        }
         pencilDelegate?.pencilGestureDidFinish(path: path)
         currentPath = nil
         state = .ended
@@ -81,7 +86,6 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesCancelled(touches, with: event)
-        print("[Pumice] gesture touchesCancelled count=\(touches.count)")
         currentPath = nil
         state = .cancelled
     }
