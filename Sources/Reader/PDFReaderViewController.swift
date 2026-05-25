@@ -118,7 +118,23 @@ final class PDFReaderViewController: UIViewController {
 
         pdfView.pageOverlayViewProvider = self
         pdfView.isInMarkupMode = true
-        print("[Pumice] load: doc.delegate set, markup=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil) pages=\(document.pageCount)")
+
+        // DIAGNOSTIC: disable PDFView's internal scroll. Cookiezby's
+        // working reference does this; their app has explicit
+        // start/end-edit modes that toggle it. We want to find out
+        // whether scroll-enabled is what's blocking overlayViewFor:
+        // from being called at all. If overlays start appearing with
+        // scroll off, we know the gesture priority is the blocker and
+        // can design a real fix. If overlays still don't appear with
+        // scroll off, the cause is elsewhere.
+        pdfView.privateScrollView?.isScrollEnabled = false
+        print("[Pumice] load: doc.delegate set, markup=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil) pages=\(document.pageCount) innerScrollEnabled=\(pdfView.privateScrollView?.isScrollEnabled ?? true)")
+
+        // Nudge PDFView into a layout pass — overlayViewFor: is only
+        // queried when a page actually has to be laid out, and an
+        // off-screen pre-load might not count.
+        pdfView.setNeedsLayout()
+        pdfView.layoutIfNeeded()
 
         // Hydrate per-page paths from any /Ink annotations already in
         // the file. We strip them from the model so they don't double-
