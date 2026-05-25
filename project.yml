@@ -41,7 +41,6 @@ targets:
       Release: Config/Local.xcconfig
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).Pumice
         PRODUCT_NAME: Pumice
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
@@ -68,7 +67,6 @@ targets:
       Release: Config/Local.xcconfig
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).PumiceTests
         GENERATE_INFOPLIST_FILE: YES
         BUNDLE_LOADER: "$(TEST_HOST)"
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Pumice.app/Pumice"
