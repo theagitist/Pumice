@@ -1,64 +1,41 @@
 import PDFKit
-import PencilKit
 import PumiceCore
 import UIKit
 
-/// `PKCanvasView` subclass with an "Apple Pencil only" hit-test mode.
-/// When `requirePencilForHit == true`, the canvas claims a touch only
-/// when the current event contains an Apple Pencil touch — finger
-/// touches fall through to PDFView's scroll gesture.
-private final class ModalCanvasView: PKCanvasView {
-    var requirePencilForHit: Bool = false
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        if requirePencilForHit {
-            guard let event,
-                  let touches = event.allTouches,
-                  touches.contains(where: { $0.type == .pencil })
-            else { return nil }
-        }
-        return super.hitTest(point, with: event)
-    }
-}
-
-/// PDFView host that uses Apple's official per-page overlay API
-/// (`PDFPageOverlayViewProvider`, iOS 16+, recommended by the PencilKit
-/// team at WWDC22 "What's new in PDFKit"). Each visible PDF page gets
-/// its own `PKCanvasView` installed by PDFKit, auto-sized to the page
-/// and scrolling/zooming with the page.
+/// PDFView host that uses Apple's `PDFPageOverlayViewProvider` (iOS 16+)
+/// to install a `PumiceCanvasView` per PDF page. Each canvas owns its
+/// own stroke list (in canvas coords, UIKit Y-down). PDFKit auto-sizes
+/// the overlay to the page, so canvas coordinates ARE page-local
+/// pixels and the strokes scroll/zoom with their page for free.
 ///
-/// Per-page drawing state lives in `drawingForPage` (keyed by `PDFPage`).
-/// When a page scrolls out of view PDFKit calls
-/// `willEndDisplayingOverlayView`; we stash the canvas's `PKDrawing`
-/// there and let PDFKit release the view. When the page comes back in,
-/// `overlayViewFor` creates a fresh canvas and we re-install the
-/// stashed drawing.
+/// We deliberately do NOT use PencilKit. Multiple iterations against
+/// iPadOS 26 hardware showed that `PKCanvasView` with
+/// `drawingPolicy = .pencilOnly` never activates its gesture pipeline
+/// inside PDFKit's overlay — the pen falls through to PDFView's
+/// scroll regardless of markup mode, first responder, or
+/// `userInteractionEnabled` on the underlying `PDFPageView`. Going
+/// to a plain `UIGestureRecognizer` subclass that explicitly accepts
+/// only `.pencil` touches gives deterministic behavior.
 ///
-/// Persistence: at save time we walk `drawingForPage`, replace any of
-/// our previously-written `/Ink` annotations on the page with fresh
-/// ones derived from the current `PKDrawing`, then `document.write(to:)`.
-/// Other PDF readers (Preview, Acrobat) render the saved `/Ink`
-/// correctly; iOS PDFView's annotation rendering is famously
-/// unreliable, which is exactly why we use the live `PKCanvasView`
-/// overlay instead of trusting PDFKit's annotation renderer.
-/// On load, existing `/Ink` annotations are reconstituted as
-/// `PKStroke`s and pushed into the per-page `PKDrawing`, then the
-/// `/Ink` annotations are removed from the model — the canvas drawing
-/// is the sole source of truth until the next save.
-///
-/// Input model: pencil always draws, finger always scrolls. The
-/// per-page canvas uses `requirePencilForHit = true` so finger touches
-/// pass through to PDFView's scroll/tap gestures. A single
-/// `allowFingerDrawing` toggle (driven from the toolbar) flips the
-/// canvases to `.anyInput` for users without a Pencil.
+/// Persistence:
+///   * On save we walk each per-page canvas, transform every stored
+///     path from canvas coords to page coords (Y-flip relative to the
+///     page height), then build a standard `/Ink` PDFAnnotation via
+///     PumiceCore's `InkAnnotationBuilder`. Replaces any previously-
+///     written `/Ink` on each page so re-saves don't accumulate.
+///   * On load we read each page's existing `/Ink` annotations, pull
+///     the bezier path out, transform back from page coords to canvas
+///     coords, and seed the per-page canvas via `setPaths(_:)`.
+///     The `/Ink` annotations are then removed from the in-memory
+///     document — the canvas is the sole source of truth until the
+///     next save.
 final class PDFReaderViewController: UIViewController {
     private let pdfView = PDFView()
-    private let toolPicker = PKToolPicker()
     private var pdfURL: URL?
     private var needsSave = false
 
-    private var drawingForPage: [PDFPage: PKDrawing] = [:]
-    private var canvasByPage: [PDFPage: ModalCanvasView] = [:]
+    private var canvasByPage: [PDFPage: PumiceCanvasView] = [:]
+    private var pathsForPage: [PDFPage: [UIBezierPath]] = [:]
 
     private let _undoManager = UndoManager()
     private var selectedAnnotation: PDFAnnotation?
@@ -76,7 +53,6 @@ final class PDFReaderViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         configurePDFView()
-        pdfView.pageOverlayViewProvider = self
 
         NotificationCenter.default.addObserver(
             self,
@@ -88,9 +64,6 @@ final class PDFReaderViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        // Drain any visible canvases into our per-page store BEFORE save —
-        // willEndDisplayingOverlayView only fires when a page scrolls out
-        // of view, not when the reader is closed mid-stream.
         syncActiveCanvases()
         saveIfNeeded()
     }
@@ -101,50 +74,59 @@ final class PDFReaderViewController: UIViewController {
         _undoManager.removeAllActions()
         selectedAnnotation = nil
         selectedAnnotationPage = nil
-        drawingForPage.removeAll()
         canvasByPage.removeAll()
+        pathsForPage.removeAll()
         controller?.refreshState()
 
         guard let document = PDFDocument(url: url) else { return }
         pdfView.document = document
 
-        // Hydrate per-page PKDrawing from existing /Ink annotations and
-        // strip those /Ink annotations from the model — the canvas
-        // drawing is the source of truth until next save.
+        // Hydrate per-page paths from any /Ink annotations already in
+        // the file. We strip them from the model so they don't double-
+        // up with what the canvas renders.
         for i in 0..<document.pageCount {
             guard let page = document.page(at: i) else { continue }
             let inkAnnotations = page.annotations.filter { $0.type == "Ink" }
-            let strokes = inkAnnotations.compactMap { Self.pkStroke(from: $0) }
-            if !strokes.isEmpty {
-                drawingForPage[page] = PKDrawing(strokes: strokes)
+            let pageHeight = page.bounds(for: .mediaBox).height
+            var canvasPaths: [UIBezierPath] = []
+            for ann in inkAnnotations {
+                for pathInPage in ann.paths ?? [] {
+                    canvasPaths.append(Self.canvasPath(fromPagePath: pathInPage, pageHeight: pageHeight))
+                }
+            }
+            if !canvasPaths.isEmpty {
+                pathsForPage[page] = canvasPaths
             }
             for ann in inkAnnotations {
                 page.removeAnnotation(ann)
             }
         }
-        print("[Pumice] load: \(drawingForPage.count) pages with prior strokes")
+        print("[Pumice] load: \(pathsForPage.count) pages with prior strokes")
     }
 
     func saveIfNeeded() {
         guard needsSave, let url = pdfURL, let document = pdfView.document else { return }
         syncActiveCanvases()
-        for (page, drawing) in drawingForPage {
+        for (page, paths) in pathsForPage {
             for ann in page.annotations where ann.type == "Ink" {
                 page.removeAnnotation(ann)
             }
             let pageIndex = document.index(for: page)
-            for stroke in drawing.strokes {
-                if let annotation = Self.inkAnnotation(from: stroke, pageIndex: pageIndex) {
-                    page.addAnnotation(annotation)
-                }
+            let pageHeight = page.bounds(for: .mediaBox).height
+            for canvasPath in paths {
+                guard let annotation = Self.inkAnnotation(
+                    fromCanvasPath: canvasPath,
+                    pageIndex: pageIndex,
+                    pageHeight: pageHeight
+                ) else { continue }
+                page.addAnnotation(annotation)
             }
         }
         if document.write(to: url) {
             needsSave = false
-            print("[Pumice] save: wrote \(drawingForPage.count) page-drawings to \(url.lastPathComponent)")
+            print("[Pumice] save: wrote \(pathsForPage.count) page-strokes to \(url.lastPathComponent)")
         }
     }
-
 
     // MARK: - Annotation toolbar actions
 
@@ -186,7 +168,7 @@ final class PDFReaderViewController: UIViewController {
 
     private func syncActiveCanvases() {
         for (page, canvas) in canvasByPage {
-            drawingForPage[page] = canvas.drawing
+            pathsForPage[page] = canvas.paths
         }
     }
 
@@ -198,12 +180,11 @@ final class PDFReaderViewController: UIViewController {
         pdfView.usePageViewController(false)
         pdfView.backgroundColor = .systemGroupedBackground
         // PDFKit only consults `pageOverlayViewProvider` when the view
-        // is in markup mode. This is undocumented in the WWDC22 video
-        // and the docs; confirmed by jtaby from Apple's PDFKit team in
-        // an Apple Developer Forums thread (forums.apple.com 709054).
-        // Without this line `overlayViewFor:` is never called and the
-        // pen falls through to PDFView's scroll gesture.
+        // is in markup mode. Undocumented in WWDC22 / API docs;
+        // confirmed in Apple Developer Forums 709054 by jtaby (Apple
+        // PDFKit team).
         pdfView.isInMarkupMode = true
+        pdfView.pageOverlayViewProvider = self
         view.addSubview(pdfView)
 
         NSLayoutConstraint.activate([
@@ -214,53 +195,57 @@ final class PDFReaderViewController: UIViewController {
         ])
     }
 
-    // MARK: - PKStroke <-> /Ink conversion
+    // MARK: - Coordinate transforms
 
-    /// Reconstitute a `PKStroke` from a `/Ink` annotation by extracting
-    /// every move/line control point from each subpath of the bezier
-    /// path. Pressure / tilt / azimuth aren't stored in `/Ink` and are
-    /// reconstructed as constants — the PRD accepts this loss to keep
-    /// round-trip editability.
-    static func pkStroke(from annotation: PDFAnnotation) -> PKStroke? {
-        guard let paths = annotation.paths, !paths.isEmpty else { return nil }
-        let color = annotation.color
-        let strokeWidth = annotation.border?.lineWidth ?? 2
-
-        var controlPoints: [PKStrokePoint] = []
-        for bezier in paths {
-            bezier.cgPath.applyWithBlock { elementPtr in
-                let elem = elementPtr.pointee
-                switch elem.type {
-                case .moveToPoint, .addLineToPoint:
-                    let location = elem.points[0]
-                    let point = PKStrokePoint(
-                        location: location,
-                        timeOffset: 0,
-                        size: CGSize(width: strokeWidth, height: strokeWidth),
-                        opacity: 1,
-                        force: 1,
-                        azimuth: 0,
-                        altitude: 0
-                    )
-                    controlPoints.append(point)
-                default:
-                    break
-                }
-            }
-        }
-        guard controlPoints.count >= 2 else { return nil }
-        let path = PKStrokePath(controlPoints: controlPoints, creationDate: Date())
-        let ink = PKInk(.pen, color: color)
-        return PKStroke(ink: ink, path: path)
+    /// Transform a `UIBezierPath` from canvas (UIKit, Y-down) to page
+    /// (PDF user space, Y-up) coordinates. Mirrors the path vertically
+    /// around the page's height.
+    static func pagePath(fromCanvasPath canvasPath: UIBezierPath, pageHeight: CGFloat) -> UIBezierPath {
+        let copy = canvasPath.copy() as! UIBezierPath
+        var t = CGAffineTransform.identity
+        t = t.translatedBy(x: 0, y: pageHeight)
+        t = t.scaledBy(x: 1, y: -1)
+        copy.apply(t)
+        return copy
     }
 
-    /// Pure builder for snap-to-text highlights: resolves a gesture's
-    /// endpoints to a `PDFSelection` and returns the corresponding
-    /// `/Highlight` `PDFAnnotation`, or `nil` if no text lies between
-    /// the points. Doesn't mutate the page — exposed as static so the
-    /// iOS integration tests can drive it without a live view
-    /// controller, and so the future snap-to-text re-integration has a
-    /// single shared implementation.
+    static func canvasPath(fromPagePath pagePath: UIBezierPath, pageHeight: CGFloat) -> UIBezierPath {
+        // The same transform is its own inverse.
+        return self.pagePath(fromCanvasPath: pagePath, pageHeight: pageHeight)
+    }
+
+    /// Convert a canvas-coord bezier path into a standard `/Ink`
+    /// PDFAnnotation via PumiceCore's builder. Flattens the path's
+    /// move/line elements into a point list — the builder smooths
+    /// them into a curve internally.
+    static func inkAnnotation(
+        fromCanvasPath canvasPath: UIBezierPath,
+        pageIndex: Int,
+        pageHeight: CGFloat
+    ) -> PDFAnnotation? {
+        let pagePath = self.pagePath(fromCanvasPath: canvasPath, pageHeight: pageHeight)
+        var pagePoints: [CGPoint] = []
+        pagePath.cgPath.applyWithBlock { ptr in
+            let elem = ptr.pointee
+            switch elem.type {
+            case .moveToPoint, .addLineToPoint:
+                pagePoints.append(elem.points[0])
+            default:
+                break
+            }
+        }
+        guard pagePoints.count >= 2 else { return nil }
+        return InkAnnotationBuilder.makeAnnotation(
+            pagePoints: pagePoints,
+            pageStrokeWidth: 2,
+            color: StrokeColor(uiColor: .label),
+            pageIndex: pageIndex,
+            uuid: UUID()
+        )
+    }
+
+    /// Snap-to-text builder kept around for the F03 integration tests
+    /// and for V2 wiring. Not called from the live path in V1.
     static func buildSnapAnnotation(
         firstPagePoint: CGPoint,
         lastPagePoint: CGPoint,
@@ -285,58 +270,28 @@ final class PDFReaderViewController: UIViewController {
         )
         return HighlightAnnotationBuilder.makeAnnotation(highlight: highlight, uuid: UUID())
     }
-
-    /// Convert a `PKStroke` into a standard `/Ink` PDFAnnotation. The
-    /// canvas's bounds equal the page's bounds (PDFKit's overlay API
-    /// sizes the canvas to the page), so stroke point locations are
-    /// already in page coordinates — no conversion needed.
-    static func inkAnnotation(from stroke: PKStroke, pageIndex: Int) -> PDFAnnotation? {
-        var pagePoints: [CGPoint] = []
-        var widthSum: CGFloat = 0
-        var widthCount = 0
-        for point in stroke.path {
-            pagePoints.append(point.location)
-            widthSum += (point.size.width + point.size.height) / 2
-            widthCount += 1
-        }
-        guard widthCount > 0 else { return nil }
-        let width = widthSum / CGFloat(widthCount)
-        let color = StrokeColor(uiColor: stroke.ink.color)
-        return InkAnnotationBuilder.makeAnnotation(
-            pagePoints: pagePoints,
-            pageStrokeWidth: width,
-            color: color,
-            pageIndex: pageIndex,
-            uuid: UUID()
-        )
-    }
 }
 
 extension PDFReaderViewController: @preconcurrency PDFPageOverlayViewProvider {
     func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> UIView? {
-        let canvas = ModalCanvasView()
-        canvas.backgroundColor = .clear
-        canvas.isOpaque = false
-        canvas.drawingPolicy = .pencilOnly
-        canvas.requirePencilForHit = true
-        canvas.isScrollEnabled = false
-        canvas.delegate = self
-        canvas.tool = PKInkingTool(.pen, color: .label, width: 2)
-        if let drawing = drawingForPage[page] {
-            canvas.drawing = drawing
+        let canvas = PumiceCanvasView()
+        if let paths = pathsForPage[page] {
+            canvas.setPaths(paths)
+        }
+        canvas.onPathFinished = { [weak self, weak page] _ in
+            guard let self, let page else { return }
+            self.pathsForPage[page] = self.canvasByPage[page]?.paths
+            self.needsSave = true
+            self.controller?.refreshState()
         }
         canvasByPage[page] = canvas
 
-        // PDFKit's internal `PDFPageView` defaults to
-        // `isUserInteractionEnabled = false`, which silently blocks
-        // every touch from reaching our overlay. Setting `isInMarkupMode`
-        // and conforming to `PDFPageOverlayViewProvider` is not enough —
-        // we have to walk `documentView.subviews` ourselves and enable
-        // interaction on each PDFPageView. Without this the pen falls
-        // through to PDFView's scroll gesture and PencilKit never sees
-        // the touch. Workaround documented in the only working open-
-        // source reference for this API (Cookiezby/ios-pdf-edit-example)
-        // and confirmed nowhere in Apple's documentation.
+        // PDFKit's internal `PDFPageView` (per-page subview inside
+        // documentView) defaults to isUserInteractionEnabled = false,
+        // so without this every touch to our overlay is silently
+        // swallowed by the parent. Class lookup is by name because
+        // the symbol isn't public. Workaround documented in
+        // Cookiezby/ios-pdf-edit-example; nowhere in Apple's docs.
         for subview in view.documentView?.subviews ?? [] {
             if NSStringFromClass(type(of: subview)) == "PDFPageView" {
                 subview.isUserInteractionEnabled = true
@@ -346,31 +301,10 @@ extension PDFReaderViewController: @preconcurrency PDFPageOverlayViewProvider {
         return canvas
     }
 
-    func pdfView(_ pdfView: PDFView, willDisplayOverlayView overlayView: UIView, for page: PDFPage) {
-        // PDFKit has just installed the canvas in the view hierarchy.
-        // becomeFirstResponder and tool-picker setVisible only work once
-        // the view is in a window, so they belong here — not in
-        // overlayViewFor where the canvas is still detached.
-        guard let canvas = overlayView as? PKCanvasView else { return }
-        toolPicker.addObserver(canvas)
-        toolPicker.setVisible(true, forFirstResponder: canvas)
-        let became = canvas.becomeFirstResponder()
-        print("[Pumice] overlay willDisplay page=\(pdfView.document?.index(for: page) ?? -1) becameFirstResponder=\(became)")
-    }
-
     func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
-        guard let canvas = overlayView as? PKCanvasView else { return }
-        drawingForPage[page] = canvas.drawing
+        guard let canvas = overlayView as? PumiceCanvasView else { return }
+        pathsForPage[page] = canvas.paths
         canvasByPage.removeValue(forKey: page)
-        toolPicker.setVisible(false, forFirstResponder: canvas)
-        toolPicker.removeObserver(canvas)
-        print("[Pumice] overlay released for page \(pdfView.document?.index(for: page) ?? -1), strokes=\(canvas.drawing.strokes.count)")
-    }
-}
-
-extension PDFReaderViewController: PKCanvasViewDelegate {
-    func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        needsSave = true
-        controller?.refreshState()
+        print("[Pumice] overlay released for page \(pdfView.document?.index(for: page) ?? -1), strokes=\(canvas.paths.count)")
     }
 }
