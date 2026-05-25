@@ -85,9 +85,5 @@ schemes:
         - Pumice
     run:
       config: Debug
-      environmentVariables:
-        - variable: CG_PDF_VERBOSE
-          value: "1"
-          isEnabled: true
     archive:
       config: Release
