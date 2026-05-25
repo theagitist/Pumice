@@ -206,6 +206,13 @@ final class PDFReaderViewController: UIViewController {
         pdfView.displayDirection = .vertical
         pdfView.usePageViewController(false)
         pdfView.backgroundColor = .systemGroupedBackground
+        // PDFKit only consults `pageOverlayViewProvider` when the view
+        // is in markup mode. This is undocumented in the WWDC22 video
+        // and the docs; confirmed by jtaby from Apple's PDFKit team in
+        // an Apple Developer Forums thread (forums.apple.com 709054).
+        // Without this line `overlayViewFor:` is never called and the
+        // pen falls through to PDFView's scroll gesture.
+        pdfView.isInMarkupMode = true
         view.addSubview(pdfView)
 
         NSLayoutConstraint.activate([
