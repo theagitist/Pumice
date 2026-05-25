@@ -10,8 +10,12 @@ final class VaultStore: ObservableObject {
     /// document automatically.
     @Published private(set) var lastOpenedRelativePath: String?
 
-    private let defaultsKey = "app.example.Pumice.vaultBookmark"
-    private let lastOpenedKey = "app.example.Pumice.lastOpenedPDF"
+    // Derive UserDefaults keys from the runtime bundle identifier so
+    // the reverse-DNS prefix doesn't have to be hard-coded in source
+    // (per local build setup, the prefix is configured in
+    // Config/Local.xcconfig and isn't checked into the repo).
+    private let defaultsKey = "\(Bundle.main.bundleIdentifier ?? "Pumice").vaultBookmark"
+    private let lastOpenedKey = "\(Bundle.main.bundleIdentifier ?? "Pumice").lastOpenedPDF"
 
     enum Status: Equatable {
         case idle
