@@ -1,6 +1,5 @@
 name: Pumice
 options:
-  bundleIdPrefix: app.example
   deploymentTarget:
     iOS: "18.0"
   developmentLanguage: en
@@ -38,11 +37,12 @@ targets:
     dependencies:
       - package: PumiceCore
     settings:
+      configFiles:
+        Debug: Config/Local.xcconfig
+        Release: Config/Local.xcconfig
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.example.Pumice
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).Pumice
         PRODUCT_NAME: Pumice
-        DEVELOPMENT_TEAM: REDACTED
-        CODE_SIGN_STYLE: Automatic
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -64,10 +64,11 @@ targets:
       - target: Pumice
       - package: PumiceCore
     settings:
+      configFiles:
+        Debug: Config/Local.xcconfig
+        Release: Config/Local.xcconfig
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.example.PumiceTests
-        DEVELOPMENT_TEAM: REDACTED
-        CODE_SIGN_STYLE: Automatic
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_IDENTIFIER_PREFIX).PumiceTests
         GENERATE_INFOPLIST_FILE: YES
         BUNDLE_LOADER: "$(TEST_HOST)"
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Pumice.app/Pumice"

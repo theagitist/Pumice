@@ -43,3 +43,6 @@ fastlane/test_output
 *.mobileprovision
 .env
 .env.local
+# Local Apple build config (DEVELOPMENT_TEAM, bundle id prefix).
+# Copy Config/Local.xcconfig.example to Config/Local.xcconfig and edit.
+Config/Local.xcconfig

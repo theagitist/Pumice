@@ -1,0 +1,15 @@
+// Local Apple build config — per-developer values that should never
+// land in the repo. Copy this file to `Local.xcconfig` (without
+// `.example`) and edit. The real file is gitignored.
+//
+// Find your team ID:
+//   Xcode → Settings → Accounts → your Apple ID → Manage Certificates
+//   (the parenthesized 10-char code beside your name)
+//
+// The bundle ID prefix is your reverse-DNS namespace; e.g. an app
+// shipped from example.com would use `com.example` and the final
+// bundle IDs become com.example.Pumice and com.example.PumiceTests.
+
+DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+CODE_SIGN_STYLE = Automatic
+PRODUCT_BUNDLE_IDENTIFIER_PREFIX = com.example
