@@ -346,7 +346,23 @@ final class PDFReaderViewController: UIViewController {
             }
         }
 
-        if document.write(to: url) {
+        // Wrap the write in NSFileCoordinator. URLs from
+        // UIDocumentPicker for File-Provider-backed locations (Möbius
+        // Sync, iCloud Drive, third-party document providers) route
+        // writes through an iOS per-app overlay first; without
+        // coordination the bytes never commit through to the backing
+        // store and other apps (Files, the sync daemon's watcher) see
+        // the unchanged file. Coordinated writes with `.forReplacing`
+        // are the public iOS API to commit through the provider.
+        // Confirmed by the Files app showing un-scribbled PDFs even
+        // after re-opening Pumice showed the saved scribbles.
+        let coordinator = NSFileCoordinator()
+        var coordinationError: NSError?
+        var writeSucceeded = false
+        coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { coordinatedURL in
+            writeSucceeded = document.write(to: coordinatedURL)
+        }
+        if writeSucceeded {
             needsSave = false
         }
     }
