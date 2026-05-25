@@ -8,6 +8,17 @@ import UIKit
 /// it (currently empty, just a marker class).
 final class PumicePDFPage: PDFPage {}
 
+/// Standalone `PDFDocumentDelegate` so PDFKit can call `classForPage()`
+/// from background queues without tripping Swift 6's MainActor
+/// concurrency assertion. The view controller is implicitly
+/// `@MainActor` (it's a UIViewController); routing the delegate
+/// through `self` crashed in `_dispatch_assert_queue_fail`.
+final class PumicePDFDocumentDelegate: NSObject, @unchecked Sendable, PDFDocumentDelegate {
+    func classForPage() -> AnyClass {
+        return PumicePDFPage.self
+    }
+}
+
 /// PDFView host that uses Apple's `PDFPageOverlayViewProvider` (iOS 16+)
 /// to install a `PumiceCanvasView` per PDF page. Each canvas owns its
 /// own stroke list (in canvas coords, UIKit Y-down). PDFKit auto-sizes
@@ -44,6 +55,7 @@ final class PDFReaderViewController: UIViewController {
     private var pathsForPage: [PDFPage: [UIBezierPath]] = [:]
 
     private let _undoManager = UndoManager()
+    private let documentDelegate = PumicePDFDocumentDelegate()
     private var selectedAnnotation: PDFAnnotation?
     private var selectedAnnotationPage: PDFPage?
 
@@ -87,10 +99,12 @@ final class PDFReaderViewController: UIViewController {
         guard let document = PDFDocument(url: url) else { return }
         // Wire the document delegate BEFORE assigning to PDFView so
         // PDFKit uses our custom PDFPage subclass from the very first
-        // page-load. The working Cookiezby reference uses this pattern
-        // and we mirror it in case PDFKit only invokes the overlay
-        // provider for documents whose pages are a custom subclass.
-        document.delegate = self
+        // page-load. The delegate is a separate, non-MainActor type:
+        // PDFKit invokes classForPage() from background queues during
+        // parsing, which triggers Swift 6's MainActor concurrency
+        // assert if the delegate is on a UIViewController (which is
+        // implicitly @MainActor).
+        document.delegate = documentDelegate
         pdfView.document = document
 
         pdfView.pageOverlayViewProvider = self
@@ -280,12 +294,6 @@ final class PDFReaderViewController: UIViewController {
             attachedNote: nil
         )
         return HighlightAnnotationBuilder.makeAnnotation(highlight: highlight, uuid: UUID())
-    }
-}
-
-extension PDFReaderViewController: @preconcurrency PDFDocumentDelegate {
-    func classForPage() -> AnyClass {
-        return PumicePDFPage.self
     }
 }
 
