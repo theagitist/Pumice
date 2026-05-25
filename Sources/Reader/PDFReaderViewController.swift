@@ -201,6 +201,16 @@ final class PDFReaderViewController: UIViewController {
     }
 
     func load(url: URL) {
+        // Force viewDidLoad to run BEFORE we set the document.
+        // SwiftUI's PDFReaderView calls load(url:) inside
+        // makeUIViewController, before the view is in a hierarchy —
+        // so without this nudge, viewDidLoad runs LATER and the
+        // pageOverlayViewProvider gets wired AFTER PDFKit has already
+        // parsed the document and decided it doesn't need overlays.
+        // Touching `view` triggers the view-loading lifecycle
+        // synchronously and runs viewDidLoad in line.
+        _ = view
+
         pdfURL = url
         needsSave = false
         _undoManager.removeAllActions()
@@ -212,7 +222,8 @@ final class PDFReaderViewController: UIViewController {
         guard let document = PDFDocument(url: url) else { return }
         document.delegate = documentDelegate
         pdfView.document = document
-        print("[Pumice] load: pages=\(document.pageCount) markup=\(pdfView.isInMarkupMode) providerKind=\(type(of: pdfView.pageOverlayViewProvider!))")
+        let providerKind = pdfView.pageOverlayViewProvider.map { String(describing: type(of: $0)) } ?? "nil"
+        print("[Pumice] load: pages=\(document.pageCount) markup=\(pdfView.isInMarkupMode) providerKind=\(providerKind)")
 
         // Hydrate per-page paths from any /Ink annotations already in
         // the file. We strip them from the model so they don't double-
