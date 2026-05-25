@@ -4,6 +4,55 @@ import Foundation
 import PDFKit
 import UIKit
 
+/// `PDFAnnotation` subclass that draws its own appearance stream.
+///
+/// Why this exists: iOS PDFKit's default writer generates a broken
+/// `/AP` (appearance stream) for `.ink` annotations — it sets the
+/// stream's `/BBox` to a small local box but emits stroke drawing
+/// commands in absolute page coordinates, so every stroke is clipped
+/// away. PDF viewers that prefer `/AP` over `/InkList` (Preview.app,
+/// macOS QuickLook, Files-app QuickLook on iPadOS, Adobe Reader)
+/// render nothing. PDFKit's own reader falls back to `/InkList`,
+/// which is the only reason Pumice itself shows the strokes correctly.
+///
+/// Overriding `draw(with:in:)` makes PDFKit capture our drawing into
+/// the appearance stream instead of synthesizing its broken default.
+/// We stroke the path in the same PDF page coordinates we use for
+/// `/InkList`, and PDFKit handles the local-coord mapping correctly
+/// when the drawing comes from our override.
+public final class PumiceInkAnnotation: PDFAnnotation {
+    private let strokePath: UIBezierPath
+    private let strokePageWidth: CGFloat
+    private let strokeUIColor: UIColor
+
+    public init(
+        path: UIBezierPath,
+        strokeColor: UIColor,
+        strokeWidth: CGFloat,
+        bounds: CGRect
+    ) {
+        self.strokePath = path
+        self.strokePageWidth = strokeWidth
+        self.strokeUIColor = strokeColor
+        super.init(bounds: bounds, forType: .ink, withProperties: nil)
+    }
+
+    @available(*, unavailable)
+    public required init?(coder: NSCoder) { fatalError("not used") }
+
+    public override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        UIGraphicsPushContext(context)
+        context.saveGState()
+        strokeUIColor.setStroke()
+        strokePath.lineWidth = strokePageWidth
+        strokePath.lineCapStyle = .round
+        strokePath.lineJoinStyle = .round
+        strokePath.stroke()
+        context.restoreGState()
+        UIGraphicsPopContext()
+    }
+}
+
 /// Builds standard PDF `/Subtype /Ink` annotations from `Stroke` values, with
 /// a deterministic `AnnotationID` stamped into the annotation's `/NM` entry.
 public enum InkAnnotationBuilder {
@@ -76,16 +125,17 @@ public enum InkAnnotationBuilder {
             .insetBy(dx: -pageStrokeWidth, dy: -pageStrokeWidth)
 
         let id = AnnotationID(pageIndex: pageIndex, annotationUUID: uuid)
-        let annotation = PDFAnnotation(
-            bounds: bounds,
-            forType: .ink,
-            withProperties: nil
+        let annotation = PumiceInkAnnotation(
+            path: path,
+            strokeColor: color.uiColor,
+            strokeWidth: pageStrokeWidth,
+            bounds: bounds
         )
 
-        // PDFAnnotation's ink path is added in PDF page coordinates,
-        // matching /Rect. With a polyline the /InkList entries are
-        // exactly the move/line vertices, which iOS PDFKit serializes
-        // correctly.
+        // Also add the path the standard way so `/InkList` carries the
+        // points for any reader that prefers the data form over the
+        // appearance stream. The subclass's `draw(with:in:)` is what
+        // produces the (correct) /AP that everyone else renders.
         annotation.add(path)
 
         annotation.color = color.uiColor
