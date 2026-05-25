@@ -262,10 +262,12 @@ final class PDFReaderViewController: UIViewController {
             self.registerUndoForAddedStroke(stroke: stroke, on: page)
             self.needsSave = true
             self.controller?.refreshState()
+            self.scheduleDebouncedSave()
         }
         overlayProvider.onEraserStroke = { [weak self] page, removedBatch in
             guard let self else { return }
             self.handleEraserBatch(removed: removedBatch, on: page)
+            self.scheduleDebouncedSave()
         }
 
         installUndoRedoGestures()
@@ -294,6 +296,8 @@ final class PDFReaderViewController: UIViewController {
         _undoManager.removeAllActions()
         overlayProvider.reset()
         controller?.refreshState()
+        saveDebounceTimer?.invalidate()
+        saveDebounceTimer = nil
 
         guard let document = PDFDocument(url: url) else { return }
         document.delegate = documentDelegate
@@ -346,16 +350,6 @@ final class PDFReaderViewController: UIViewController {
             }
         }
 
-        // Wrap the write in NSFileCoordinator. URLs from
-        // UIDocumentPicker for File-Provider-backed locations (Möbius
-        // Sync, iCloud Drive, third-party document providers) route
-        // writes through an iOS per-app overlay first; without
-        // coordination the bytes never commit through to the backing
-        // store and other apps (Files, the sync daemon's watcher) see
-        // the unchanged file. Coordinated writes with `.forReplacing`
-        // are the public iOS API to commit through the provider.
-        // Confirmed by the Files app showing un-scribbled PDFs even
-        // after re-opening Pumice showed the saved scribbles.
         let coordinator = NSFileCoordinator()
         var coordinationError: NSError?
         var writeSucceeded = false
@@ -364,6 +358,27 @@ final class PDFReaderViewController: UIViewController {
         }
         if writeSucceeded {
             needsSave = false
+        }
+        saveDebounceTimer?.invalidate()
+        saveDebounceTimer = nil
+    }
+
+    // MARK: - Debounced autosave
+
+    /// Pending 2-second timer to autosave after the last stroke. Each
+    /// new stroke restarts the timer so a flurry of strokes doesn't
+    /// trigger a save in the middle of drawing — only ~2s of pen
+    /// inactivity fires the save. Matches Nutrient/PSPDFKit's
+    /// recommendation of "save at natural pauses, never on a fixed
+    /// interval."
+    private var saveDebounceTimer: Timer?
+
+    private func scheduleDebouncedSave() {
+        saveDebounceTimer?.invalidate()
+        saveDebounceTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.saveIfNeeded()
+            }
         }
     }
 

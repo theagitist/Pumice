@@ -175,6 +175,22 @@ struct VaultBrowserView: View {
             }
             .disabled(!readerController.canRedo)
             .help("Redo")
+
+            if let url = selection, url.pathExtension.lowercased() == "pdf" {
+                // ShareLink presents the iOS share sheet on tap. The
+                // simultaneousGesture flushes any pending strokes to
+                // disk first, so the file the share sheet hands off is
+                // the latest version. PDFDocument.write is synchronous
+                // and fast, so the save completes before the share
+                // sheet finishes rendering.
+                ShareLink(item: url) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .simultaneousGesture(TapGesture().onEnded {
+                    readerController.saveIfNeeded()
+                })
+                .help("Share")
+            }
         }
     }
 
