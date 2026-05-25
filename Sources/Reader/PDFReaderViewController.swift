@@ -81,6 +81,14 @@ final class PDFReaderViewController: UIViewController {
         guard let document = PDFDocument(url: url) else { return }
         pdfView.document = document
 
+        // Enable the overlay AFTER setting the document. The
+        // Cookiezby working reference does this order; setting these
+        // before the document is loaded results in PDFKit silently
+        // ignoring the provider.
+        pdfView.pageOverlayViewProvider = self
+        pdfView.isInMarkupMode = true
+        print("[Pumice] load: enabled provider+markup AFTER document set; markup=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil)")
+
         // Hydrate per-page paths from any /Ink annotations already in
         // the file. We strip them from the model so they don't double-
         // up with what the canvas renders.
@@ -179,14 +187,8 @@ final class PDFReaderViewController: UIViewController {
         pdfView.displayDirection = .vertical
         pdfView.usePageViewController(false)
         pdfView.backgroundColor = .systemGroupedBackground
-        // PDFKit only consults `pageOverlayViewProvider` when the view
-        // is in markup mode. Undocumented in WWDC22 / API docs;
-        // confirmed in Apple Developer Forums 709054 by jtaby (Apple
-        // PDFKit team).
-        pdfView.isInMarkupMode = true
-        pdfView.pageOverlayViewProvider = self
         view.addSubview(pdfView)
-        print("[Pumice] configurePDFView: isInMarkupMode=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil)")
+        print("[Pumice] configurePDFView: pdfView added to view hierarchy")
 
         NSLayoutConstraint.activate([
             pdfView.topAnchor.constraint(equalTo: view.topAnchor),
