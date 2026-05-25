@@ -17,10 +17,16 @@ import UIKit
 /// we transform to page coordinates (Y-flip) before building the
 /// standard `/Ink` annotation via PumiceCore.
 final class PumiceCanvasView: UIView {
-    var strokeColor: UIColor = .label {
+    // Use an explicit color rather than .label — .label is a dynamic
+    // color whose cgColor depends on the current trait collection,
+    // which is in an undefined state before the view enters the
+    // window. CAShapeLayer captures the cgColor at assignment time,
+    // so a deferred-resolution dynamic color can render as
+    // transparent. systemBlue is always opaque and visible.
+    var strokeColor: UIColor = .systemBlue {
         didSet { applyStrokeStyle() }
     }
-    var strokeWidth: CGFloat = 2 {
+    var strokeWidth: CGFloat = 3 {
         didSet { applyStrokeStyle() }
     }
 
@@ -113,13 +119,23 @@ final class PumiceCanvasView: UIView {
 
 extension PumiceCanvasView: @preconcurrency PumicePencilGestureDelegate {
     func pencilGestureDidUpdate(path: UIBezierPath) {
+        print("[Pumice] canvas didUpdate pathBounds=\(path.bounds) elements=\(path.cgPath.numberOfPoints()) liveLayerFrame=\(liveLayer.frame)")
         liveLayer.path = path.cgPath
     }
 
     func pencilGestureDidFinish(path: UIBezierPath) {
+        print("[Pumice] canvas didFinish pathBounds=\(path.bounds) totalPaths=\(paths.count + 1)")
         paths.append(path)
         liveLayer.path = nil
         rebuildCommittedLayer()
         onPathFinished?(path)
+    }
+}
+
+private extension CGPath {
+    func numberOfPoints() -> Int {
+        var count = 0
+        applyWithBlock { _ in count += 1 }
+        return count
     }
 }
