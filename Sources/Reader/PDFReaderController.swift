@@ -7,28 +7,47 @@ final class PDFReaderController: ObservableObject {
     @Published private(set) var canUndo: Bool = false
     @Published private(set) var canRedo: Bool = false
 
-    /// User-facing pen settings. The SwiftUI toolbar binds to these
-    /// directly; `didSet` forwards the choice through to the underlying
-    /// view controller so the active canvas picks up the change without
-    /// the user having to lift their pen.
-    ///
-    /// Picking a color or width while the eraser is active also
-    /// auto-switches back to the pen tool — the user clearly meant to
-    /// resume drawing, not to configure the pen for later.
+    /// Currently active drawing tool. Each tool keeps its own color
+    /// and width below — switching tools doesn't clobber the
+    /// destination tool's last choice.
+    @Published var activeTool: Tool = .pen {
+        didSet {
+            guard oldValue != activeTool else { return }
+            viewController?.setActiveTool(activeTool)
+            applyCurrentToolStyleToVC()
+        }
+    }
+
     @Published var penColor: PenColor = .blue {
         didSet {
+            guard oldValue != penColor else { return }
+            // Picking a pen color while the eraser is active clearly
+            // means "I want to draw again." Switch tool back.
+            if activeTool != .pen { activeTool = .pen }
             viewController?.setPenColor(penColor.uiColor)
-            if isEraserActive { isEraserActive = false }
         }
     }
     @Published var penWidth: PenWidth = .medium {
         didSet {
+            guard oldValue != penWidth else { return }
+            if activeTool != .pen { activeTool = .pen }
             viewController?.setPenWidth(penWidth.points)
-            if isEraserActive { isEraserActive = false }
         }
     }
-    @Published var isEraserActive: Bool = false {
-        didSet { viewController?.setEraserActive(isEraserActive) }
+
+    @Published var highlightColor: HighlightPenColor = .yellow {
+        didSet {
+            guard oldValue != highlightColor else { return }
+            if activeTool != .highlighter { activeTool = .highlighter }
+            viewController?.setHighlightColor(highlightColor)
+        }
+    }
+    @Published var highlightWidth: HighlightWidth = .medium {
+        didSet {
+            guard oldValue != highlightWidth else { return }
+            if activeTool != .highlighter { activeTool = .highlighter }
+            viewController?.setHighlightWidth(highlightWidth.points)
+        }
     }
 
     weak var viewController: PDFReaderViewController?
@@ -43,6 +62,37 @@ final class PDFReaderController: ObservableObject {
 
     func redo() {
         viewController?.redoLastChange()
+    }
+
+    /// Apple Pencil double-tap (Pencil 2 or Pencil Pro) alternates
+    /// between pen and highlighter. The double-tap doesn't touch the
+    /// eraser — eraser-via-Pencil is a separate held gesture handled
+    /// below.
+    func alternatePenAndHighlighter() {
+        switch activeTool {
+        case .pen:         activeTool = .highlighter
+        case .highlighter: activeTool = .pen
+        case .eraser:      activeTool = .pen
+        }
+    }
+
+    /// Pencil Pro squeeze-and-hold sets the eraser while held. The
+    /// tool the user was on before the squeeze is restored when the
+    /// squeeze ends. Pencil 2 (no squeeze hardware) doesn't trigger
+    /// this — those users use the toolbar to reach the eraser.
+    private var preEraserTool: Tool = .pen
+
+    func beginEraserHold() {
+        if activeTool != .eraser {
+            preEraserTool = activeTool
+            activeTool = .eraser
+        }
+    }
+
+    func endEraserHold() {
+        if activeTool == .eraser {
+            activeTool = preEraserTool
+        }
     }
 
     /// Called by the view controller whenever the undo stack changes.
@@ -68,6 +118,14 @@ final class PDFReaderController: ObservableObject {
         if canUndo != newCanUndo { canUndo = newCanUndo }
         if canRedo != newCanRedo { canRedo = newCanRedo }
     }
+
+    fileprivate func applyCurrentToolStyleToVC() {
+        guard let vc = viewController else { return }
+        vc.setPenColor(penColor.uiColor)
+        vc.setPenWidth(penWidth.points)
+        vc.setHighlightColor(highlightColor)
+        vc.setHighlightWidth(highlightWidth.points)
+    }
 }
 
 @MainActor
@@ -75,13 +133,12 @@ extension PDFReaderController {
     func attach(_ vc: PDFReaderViewController) {
         viewController = vc
         vc.controller = self
-        // Sync current pen settings to the freshly-attached view
-        // controller so the provider applies them to every canvas it
-        // builds for this document. These don't mutate `@Published`
-        // state, so they're safe to invoke synchronously.
-        vc.setPenColor(penColor.uiColor)
-        vc.setPenWidth(penWidth.points)
-        vc.setEraserActive(isEraserActive)
+        // Sync current tool + per-tool styling so the provider applies
+        // them to every canvas it builds for this document. These
+        // don't mutate `@Published` state, so they're safe to invoke
+        // synchronously.
+        vc.setActiveTool(activeTool)
+        applyCurrentToolStyleToVC()
         // `attach` is called from `make/updateUIViewController`, which runs
         // mid-view-update. Mutating `@Published` state here would trigger
         // SwiftUI's "publishing during view updates" fault and cause taps

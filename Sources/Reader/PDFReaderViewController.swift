@@ -43,16 +43,20 @@ final class PumiceOverlayProvider: NSObject, @unchecked Sendable {
     private var strokesForPage: [PDFPage: [StrokeRecord]] = [:]
     private var canvasByPage: [PDFPage: PumiceCanvasView] = [:]
 
-    /// Current pen settings. Applied to every new canvas as it is
+    /// Current tool settings. Applied to every new canvas as it is
     /// created, and pushed onto live canvases via the setters below
-    /// when the user changes them from the toolbar.
+    /// when the user changes them from the toolbar. Pen + highlighter
+    /// styles are tracked separately so switching tools restores each
+    /// tool's last choice.
+    @MainActor private var mode: PumiceCanvasView.Mode = .pen
     @MainActor private var penColor: UIColor = .systemBlue
     @MainActor private var penWidth: CGFloat = 3
-    @MainActor private var isEraserActive: Bool = false
+    @MainActor private var highlightColor: UIColor = UIColor(red: 1.0, green: 0.92, blue: 0.23, alpha: 1.0)
+    @MainActor private var highlightWidth: CGFloat = 14
 
-    /// Called whenever a new stroke is finished on any canvas. Receives
-    /// the page and the freshly committed record so the controller can
-    /// register an undo action for it.
+    /// Called whenever a new pen stroke is finished on any canvas.
+    /// Receives the page and the freshly committed record so the
+    /// controller can register an undo action for it.
     var onPathFinished: (@MainActor (PDFPage, StrokeRecord) -> Void)?
 
     /// Called when an eraser gesture finishes on a canvas, carrying
@@ -60,6 +64,12 @@ final class PumiceOverlayProvider: NSObject, @unchecked Sendable {
     /// removed them from its own state; the provider mirrors that into
     /// `strokesForPage` and the controller registers the undo batch.
     var onEraserStroke: (@MainActor (PDFPage, [StrokeRecord]) -> Void)?
+
+    /// Called when a highlighter gesture finishes on a canvas, carrying
+    /// the page and the first/last canvas-space points. The controller
+    /// converts to PDF user space and asks PumiceCore to snap to the
+    /// underlying text.
+    var onHighlightStrokeFinished: (@MainActor (PDFPage, CGPoint, CGPoint) -> Void)?
 
     func setStrokes(_ strokes: [StrokeRecord], for page: PDFPage) {
         lock.lock(); defer { lock.unlock() }
@@ -133,17 +143,33 @@ final class PumiceOverlayProvider: NSObject, @unchecked Sendable {
         for canvas in canvases { canvas.penWidth = width }
     }
 
-    @MainActor func setEraserActive(_ active: Bool) {
-        isEraserActive = active
+    @MainActor func setMode(_ newMode: PumiceCanvasView.Mode) {
+        mode = newMode
         lock.lock()
         let canvases = Array(canvasByPage.values)
         lock.unlock()
-        for canvas in canvases { canvas.isEraserActive = active }
+        for canvas in canvases { canvas.mode = newMode }
+    }
+
+    @MainActor func setHighlightColor(_ color: UIColor) {
+        highlightColor = color
+        lock.lock()
+        let canvases = Array(canvasByPage.values)
+        lock.unlock()
+        for canvas in canvases { canvas.highlightColor = color }
+    }
+
+    @MainActor func setHighlightWidth(_ width: CGFloat) {
+        highlightWidth = width
+        lock.lock()
+        let canvases = Array(canvasByPage.values)
+        lock.unlock()
+        for canvas in canvases { canvas.highlightWidth = width }
     }
 
     @MainActor var currentPenColor: UIColor { penColor }
     @MainActor var currentPenWidth: CGFloat { penWidth }
-    @MainActor var currentEraserActive: Bool { isEraserActive }
+    @MainActor var currentMode: PumiceCanvasView.Mode { mode }
 }
 
 extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
@@ -152,7 +178,9 @@ extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
         let canvas = PumiceCanvasView()
         canvas.penColor = penColor
         canvas.penWidth = penWidth
-        canvas.isEraserActive = isEraserActive
+        canvas.highlightColor = highlightColor
+        canvas.highlightWidth = highlightWidth
+        canvas.mode = mode
         let existing: [StrokeRecord]? = {
             lock.lock(); defer { lock.unlock() }
             return strokesForPage[page]
@@ -177,6 +205,12 @@ extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
             self.lock.unlock()
             DispatchQueue.main.async { [weak self] in
                 self?.onEraserStroke?(page, removedBatch)
+            }
+        }
+        canvas.onHighlightStrokeFinished = { [weak self, weak page] first, last in
+            guard let self, let page else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.onHighlightStrokeFinished?(page, first, last)
             }
         }
         lock.lock()
@@ -269,6 +303,10 @@ final class PDFReaderViewController: UIViewController {
             self.handleEraserBatch(removed: removedBatch, on: page)
             self.scheduleDebouncedSave()
         }
+        overlayProvider.onHighlightStrokeFinished = { [weak self] page, first, last in
+            guard let self else { return }
+            self.handleHighlightStrokeFinished(first: first, last: last, on: page)
+        }
 
         installUndoRedoGestures()
         installPencilInteraction()
@@ -359,6 +397,22 @@ final class PDFReaderViewController: UIViewController {
         if writeSucceeded {
             needsSave = false
         }
+
+        // Strip the `/Ink` annotations we just stamped into each page.
+        // The canvas is the in-memory source of truth between saves —
+        // leaving the saved `/Ink` on the page would cause PDFKit to
+        // double-render every stroke (once via our PumiceInkAnnotation
+        // subclass, once via the canvas's CAShapeLayer). The user
+        // wouldn't see the duplicate while the canvas's stroke layer
+        // sits on top, but the eraser would appear delayed: erasing
+        // a stroke removes only the canvas layer; the PumiceInkAnnotation
+        // underneath stays visible until the next save's re-strip.
+        for (page, _) in snapshot {
+            for ann in page.annotations where ann.type == "Ink" {
+                page.removeAnnotation(ann)
+            }
+        }
+
         saveDebounceTimer?.invalidate()
         saveDebounceTimer = nil
     }
@@ -392,8 +446,22 @@ final class PDFReaderViewController: UIViewController {
         overlayProvider.setPenWidth(width)
     }
 
-    func setEraserActive(_ active: Bool) {
-        overlayProvider.setEraserActive(active)
+    func setActiveTool(_ tool: Tool) {
+        let mode: PumiceCanvasView.Mode
+        switch tool {
+        case .pen:         mode = .pen
+        case .highlighter: mode = .highlighter
+        case .eraser:      mode = .eraser
+        }
+        overlayProvider.setMode(mode)
+    }
+
+    func setHighlightColor(_ color: HighlightPenColor) {
+        overlayProvider.setHighlightColor(color.uiColor)
+    }
+
+    func setHighlightWidth(_ width: CGFloat) {
+        overlayProvider.setHighlightWidth(width)
     }
 
     // MARK: - Toolbar actions
@@ -476,6 +544,88 @@ final class PDFReaderViewController: UIViewController {
         controller?.refreshState()
     }
 
+    // MARK: - Highlighter
+
+    /// Called when a highlighter gesture finishes. Converts the gesture
+    /// endpoints from canvas (UIKit Y-down) to PDF user space (Y-up),
+    /// asks PumiceCore to snap to the underlying text, and adds the
+    /// resulting `/Highlight` annotation to the page. Silent no-op if
+    /// no text underlies the gesture — we'd rather drop the stroke
+    /// than draw freehand ink in the wrong tool mode.
+    private func handleHighlightStrokeFinished(first: CGPoint, last: CGPoint, on page: PDFPage) {
+        guard let document = pdfView.document else { return }
+        let pageHeight = page.bounds(for: .mediaBox).height
+        let firstPage = CGPoint(x: first.x, y: pageHeight - first.y)
+        let lastPage = CGPoint(x: last.x, y: pageHeight - last.y)
+        let pageIndex = document.index(for: page)
+        let strokeColor = (controller?.highlightColor ?? .yellow).highlightColor.rgba
+
+        guard let annotation = Self.buildSnapAnnotation(
+            firstPagePoint: firstPage,
+            lastPagePoint: lastPage,
+            on: page,
+            pageIndex: pageIndex,
+            strokeColor: strokeColor
+        ) else { return }
+
+        page.addAnnotation(annotation)
+        // iOS 26 PDFKit caches each page's rendering in a PDFPageView
+        // subview of pdfView.documentView. setNeedsDisplay on the PDFView
+        // (or documentView) does NOT propagate to those page-level
+        // caches, so a freshly-added annotation isn't drawn until the
+        // page is scrolled off and back. Invalidate the per-page
+        // subview directly.
+        forcePDFPageRedraw()
+
+        registerUndoForAddedHighlight(annotation, on: page)
+        needsSave = true
+        controller?.refreshState()
+        scheduleDebouncedSave()
+    }
+
+    /// Invalidate each PDFPageView's cached rendering so PDFKit will
+    /// invoke `draw(with:in:)` on the next display tick. Without this,
+    /// freshly-added annotations don't draw until the page is scrolled
+    /// off-screen and back (on iOS 26). Called from
+    /// `handleHighlightStrokeFinished` and from the undo/redo paths
+    /// that add or remove highlights.
+    private func forcePDFPageRedraw() {
+        for sv in pdfView.documentView?.subviews ?? [] {
+            if NSStringFromClass(type(of: sv)) == "PDFPageView" {
+                sv.setNeedsDisplay()
+                sv.layer.setNeedsDisplay()
+            }
+        }
+    }
+
+    private func registerUndoForAddedHighlight(_ annotation: PDFAnnotation, on page: PDFPage) {
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performUndoRemoveHighlight(annotation, on: page)
+        }
+    }
+
+    private func performUndoRemoveHighlight(_ annotation: PDFAnnotation, on page: PDFPage) {
+        page.removeAnnotation(annotation)
+        forcePDFPageRedraw()
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performRedoAddHighlight(annotation, on: page)
+        }
+        needsSave = true
+        controller?.refreshState()
+        scheduleDebouncedSave()
+    }
+
+    private func performRedoAddHighlight(_ annotation: PDFAnnotation, on page: PDFPage) {
+        page.addAnnotation(annotation)
+        forcePDFPageRedraw()
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performUndoRemoveHighlight(annotation, on: page)
+        }
+        needsSave = true
+        controller?.refreshState()
+        scheduleDebouncedSave()
+    }
+
     // MARK: - Gesture shortcuts
 
     /// Two-finger double-tap → undo. The three-finger swipe-left/right
@@ -497,22 +647,25 @@ final class PDFReaderViewController: UIViewController {
         undoLastChange()
     }
 
-    // MARK: - Apple Pencil press → toggle eraser
+    // MARK: - Apple Pencil gestures
 
-    /// Apple Pencil 2 reports the side double-tap and Apple Pencil Pro
-    /// reports the barrel squeeze through the same `UIPencilInteraction`
-    /// delegate. We use either to flip eraser mode, ignoring the
-    /// user's system-wide preferred-tap action — the toolbar Menu is
-    /// always there as a backup, and "press to erase" is consistent
-    /// with how Notes treats the pencil.
+    /// Two `UIPencilInteraction` events, two distinct behaviors:
+    ///   * **double-tap** (Pencil 2 or Pencil Pro side tap) alternates
+    ///     between pen and highlighter — a quick way to flip between
+    ///     freehand and snap-to-text without going through the menu.
+    ///   * **squeeze-and-hold** (Pencil Pro only) sets the eraser for
+    ///     as long as the squeeze is held; releasing the squeeze
+    ///     restores whichever tool was active before. Lets the user
+    ///     rub out a stray stroke mid-annotation and pop straight back
+    ///     to drawing without touching the toolbar.
+    ///
+    /// We ignore the user's system-wide preferred-tap action — the
+    /// toolbar Menu is always there as a fallback, and we want
+    /// Pumice's gestures to be predictable across users.
     private func installPencilInteraction() {
         let interaction = UIPencilInteraction()
         interaction.delegate = self
         view.addInteraction(interaction)
-    }
-
-    private func toggleEraserFromPencil() {
-        controller?.isEraserActive.toggle()
     }
 
     // MARK: - Plumbing
@@ -615,13 +768,27 @@ final class PDFReaderViewController: UIViewController {
 
 extension PDFReaderViewController: UIPencilInteractionDelegate {
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
-        toggleEraserFromPencil()
+        // Both Pencil 2 and Pencil Pro report the side double-tap
+        // through this method. Alternate between pen and highlighter.
+        controller?.alternatePenAndHighlighter()
     }
 
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        // Only act on the squeeze's end so a long hold doesn't oscillate.
-        guard squeeze.phase == .ended else { return }
-        toggleEraserFromPencil()
+        // Pencil Pro only. Hold = eraser; release = previous tool.
+        switch squeeze.phase {
+        case .began:
+            controller?.beginEraserHold()
+        case .ended, .cancelled:
+            controller?.endEraserHold()
+        case .changed:
+            // The squeeze is still being held; we already entered the
+            // eraser on `.began`. Re-entering would be idempotent but
+            // would also re-set `preEraserTool` if the user had
+            // somehow flipped tools mid-squeeze; safest to no-op.
+            break
+        @unknown default:
+            controller?.endEraserHold()
+        }
     }
 }
 

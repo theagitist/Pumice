@@ -100,6 +100,22 @@ struct RoundTripTests {
 
         // 2 lines × 4 corners each.
         #expect(reloadedHighlight.quadrilateralPoints?.count == 8)
+
+        // Every quad point must be local to `bounds.origin`, i.e.
+        // inside `[0, 0, bounds.width, bounds.height]`. iOS PDFKit
+        // silently drops the annotation otherwise (points outside
+        // /Rect are ignored per the PDF spec) and the highlight
+        // never renders. Without this assertion the bug we hit on
+        // 2026-05-25 could regress invisibly: only on hardware, with
+        // no test failure.
+        let bounds = reloadedHighlight.bounds
+        for (i, value) in (reloadedHighlight.quadrilateralPoints ?? []).enumerated() {
+            let p = value.cgPointValue
+            #expect(p.x >= -0.001 && p.x <= bounds.width + 0.001,
+                    "quad point \(i) x=\(p.x) outside local bounds [0, \(bounds.width)]")
+            #expect(p.y >= -0.001 && p.y <= bounds.height + 0.001,
+                    "quad point \(i) y=\(p.y) outside local bounds [0, \(bounds.height)]")
+        }
     }
 
     @Test("Ink and highlight on the same page are independently addressable by ID")

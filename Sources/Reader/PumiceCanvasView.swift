@@ -5,23 +5,35 @@ import UIKit
 /// the page's subview, so coordinates are page-local (UIKit Y-down).
 ///
 /// Rendering:
-///   * each committed stroke gets its own `CAShapeLayer` so per-stroke
-///     color and width survive the round-trip (a single shared shape
-///     layer would force every stroke on a page to share one style);
-///   * `liveLayer` shows the in-progress pen stroke;
+///   * each committed pen stroke gets its own `CAShapeLayer` so per-
+///     stroke color and width survive the round-trip (a single shared
+///     shape layer would force every stroke on a page to share one
+///     style);
+///   * `liveLayer` shows the in-progress pen/highlighter stroke;
 ///   * `cursorLayer` shows an outlined circle at the pencil tip while
 ///     the eraser is engaged — the gesture doesn't leave a trail in
 ///     eraser mode, it just rubs strokes out as it passes over them.
 ///
-/// Strokes are stored as `StrokeRecord` (path + color + width) in the
-/// canvas's coordinate system. When committing to PDF (via the owning
-/// view controller) we transform path coordinates to page space
+/// Pen strokes are stored as `StrokeRecord` (path + color + width) in
+/// the canvas's coordinate system. When committing to PDF (via the
+/// owning view controller) we transform path coordinates to page space
 /// (Y-flip) before building the standard `/Ink` annotation via
 /// PumiceCore.
+///
+/// Highlighter strokes are NOT stored locally — they're routed to the
+/// owning view controller via `onHighlightStrokeFinished`, which snaps
+/// the first/last points to PDF text and adds a real `/Highlight`
+/// annotation to the page. PDFKit renders the annotation natively.
 final class PumiceCanvasView: UIView {
-    /// Pen settings used for the NEXT stroke (and for the in-progress
-    /// `liveLayer` preview). Existing strokes keep whatever style they
-    /// were drawn with.
+    enum Mode {
+        case pen
+        case highlighter
+        case eraser
+    }
+
+    /// Pen style used for the NEXT pen stroke (and for the in-progress
+    /// `liveLayer` preview while drawing in pen mode). Existing pen
+    /// strokes keep whatever style they were drawn with.
     var penColor: UIColor = .systemBlue {
         didSet { applyLiveStyle() }
     }
@@ -29,24 +41,47 @@ final class PumiceCanvasView: UIView {
         didSet { applyLiveStyle() }
     }
 
-    /// When true, finished pencil strokes are reported via
-    /// `onEraserStroke` instead of being committed and drawn. The
-    /// canvas hit-tests each pencil sub-move against existing strokes
-    /// and removes them in-place so the eraser visibly works as it
-    /// passes over them.
-    var isEraserActive: Bool = false {
-        didSet { if !isEraserActive { hideEraserCursor() } }
+    /// Highlighter live-preview style. These never affect the final
+    /// `/Highlight` annotation (the snap step uses the text bounds);
+    /// they only style the in-progress band the user sees while
+    /// dragging across text.
+    var highlightColor: UIColor = UIColor(red: 1.0, green: 0.92, blue: 0.23, alpha: 1.0) {
+        didSet { applyLiveStyle() }
+    }
+    var highlightWidth: CGFloat = 14 {
+        didSet { applyLiveStyle() }
+    }
+
+    /// Live-preview alpha for the highlighter band. Translucent so
+    /// the underlying PDF text reads through while dragging.
+    private let highlightLiveAlpha: CGFloat = 0.35
+
+    /// Current drawing mode. Setting it tears down any in-flight
+    /// state from the previous mode (live trail, eraser cursor).
+    var mode: Mode = .pen {
+        didSet {
+            guard oldValue != mode else { return }
+            liveLayer.path = nil
+            hideEraserCursor()
+            applyLiveStyle()
+        }
     }
 
     private(set) var strokes: [StrokeRecord] = []
 
-    /// Fired once at the end of a successful pen stroke.
+    /// Fired once at the end of a successful pen stroke (mode == .pen).
     var onPathFinished: ((StrokeRecord) -> Void)?
 
-    /// Fired once at the end of an eraser gesture, carrying every
-    /// stroke that the gesture erased. Empty batches are NOT reported
-    /// — a gesture that hit nothing is a no-op.
+    /// Fired once at the end of an eraser gesture (mode == .eraser),
+    /// carrying every stroke the gesture erased. Empty batches are
+    /// NOT reported — a gesture that hit nothing is a no-op.
     var onEraserStroke: (([StrokeRecord]) -> Void)?
+
+    /// Fired once at the end of a successful highlighter stroke
+    /// (mode == .highlighter). Carries the gesture's first and last
+    /// canvas-space points so the controller can convert to PDF
+    /// user space and ask PumiceCore for the snapped text selection.
+    var onHighlightStrokeFinished: ((_ first: CGPoint, _ last: CGPoint) -> Void)?
 
     /// Eraser hit-test radius in canvas points. Strokes whose sample
     /// points come within `eraserRadius + stroke.width/2` of the
@@ -60,6 +95,12 @@ final class PumiceCanvasView: UIView {
     // Per-gesture eraser state.
     private var eraserLastPoint: CGPoint?
     private var erasedDuringGesture: [StrokeRecord] = []
+
+    // Per-gesture highlighter state — we only need the first/last
+    // point for the snap, but tracking the first lets us report a
+    // gesture that never moved (a tap on text) as a single-point
+    // selection too.
+    private var highlightFirstPoint: CGPoint?
 
     private lazy var gesture: PumicePencilGestureRecognizer = {
         let g = PumicePencilGestureRecognizer()
@@ -98,9 +139,10 @@ final class PumiceCanvasView: UIView {
         for layer in strokeLayers { layer.frame = bounds }
     }
 
-    /// Replace the entire stroke list and rebuild the per-stroke
+    /// Replace the entire pen-stroke list and rebuild the per-stroke
     /// layers. Used on document load and on undo/redo / external erase
-    /// operations driven from the provider.
+    /// operations driven from the provider. Doesn't touch highlights —
+    /// those live as native `PDFAnnotation`s on the page.
     func setStrokes(_ newStrokes: [StrokeRecord]) {
         strokes = newStrokes
         rebuildStrokeLayers()
@@ -114,8 +156,18 @@ final class PumiceCanvasView: UIView {
     }
 
     private func applyLiveStyle() {
-        liveLayer.strokeColor = penColor.cgColor
-        liveLayer.lineWidth = penWidth
+        switch mode {
+        case .pen:
+            liveLayer.strokeColor = penColor.cgColor
+            liveLayer.lineWidth = penWidth
+        case .highlighter:
+            liveLayer.strokeColor = highlightColor.withAlphaComponent(highlightLiveAlpha).cgColor
+            liveLayer.lineWidth = highlightWidth
+        case .eraser:
+            // No live trail in eraser mode.
+            liveLayer.strokeColor = UIColor.clear.cgColor
+            liveLayer.lineWidth = 0
+        }
     }
 
     private func rebuildStrokeLayers() {
@@ -234,21 +286,30 @@ final class PumiceCanvasView: UIView {
 extension PumiceCanvasView: @preconcurrency PumicePencilGestureDelegate {
     func pencilGestureDidUpdate(path: UIBezierPath) {
         let currentPoint = path.currentPoint
-        if isEraserActive {
+        switch mode {
+        case .pen, .highlighter:
+            liveLayer.path = path.cgPath
+            if mode == .highlighter && highlightFirstPoint == nil {
+                // The recognizer's path always starts with a moveTo
+                // at the first touchesBegan point — capture it for
+                // the snap so we don't need to walk the path later.
+                highlightFirstPoint = path.cgPath.firstPoint ?? currentPoint
+            }
+        case .eraser:
             // No live trail in eraser mode — only the circle cursor.
             liveLayer.path = nil
             showEraserCursor(at: currentPoint)
             let from = eraserLastPoint ?? currentPoint
             eraseAlong(from: from, to: currentPoint)
             eraserLastPoint = currentPoint
-        } else {
-            liveLayer.path = path.cgPath
         }
     }
 
     func pencilGestureDidFinish(path: UIBezierPath) {
         liveLayer.path = nil
-        if isEraserActive {
+
+        switch mode {
+        case .eraser:
             // Finish the last segment with the gesture's actual end
             // point in case `touchesEnded` carried sub-touches the
             // last `touchesMoved` didn't see.
@@ -260,11 +321,34 @@ extension PumiceCanvasView: @preconcurrency PumicePencilGestureDelegate {
             erasedDuringGesture.removeAll()
             eraserLastPoint = nil
             if !batch.isEmpty { onEraserStroke?(batch) }
-            return
+
+        case .highlighter:
+            let first = highlightFirstPoint ?? path.cgPath.firstPoint ?? path.currentPoint
+            highlightFirstPoint = nil
+            onHighlightStrokeFinished?(first, path.currentPoint)
+
+        case .pen:
+            let record = StrokeRecord(path: path, color: penColor, width: penWidth)
+            strokes.append(record)
+            appendLayer(for: record)
+            onPathFinished?(record)
         }
-        let record = StrokeRecord(path: path, color: penColor, width: penWidth)
-        strokes.append(record)
-        appendLayer(for: record)
-        onPathFinished?(record)
+    }
+}
+
+private extension CGPath {
+    /// Returns the first `moveTo` point in the path, if any.
+    /// The pencil gesture recognizer always begins its path with a
+    /// `moveTo` at the first touch, so this is the gesture's origin.
+    var firstPoint: CGPoint? {
+        var found: CGPoint?
+        applyWithBlock { ptr in
+            if found != nil { return }
+            let elem = ptr.pointee
+            if elem.type == .moveToPoint {
+                found = elem.points[0]
+            }
+        }
+        return found
     }
 }

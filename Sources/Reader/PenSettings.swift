@@ -1,3 +1,4 @@
+import PumiceCore
 import SwiftUI
 import UIKit
 
@@ -11,6 +12,34 @@ struct StrokeRecord {
     let path: UIBezierPath
     let color: UIColor
     let width: CGFloat
+}
+
+/// The three drawing tools the reader exposes. Each owns its own
+/// remembered color and width — switching tool preserves the last
+/// choice you made in the destination tool.
+enum Tool: String, CaseIterable, Identifiable, Hashable {
+    case pen
+    case highlighter
+    case eraser
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .pen:         return "Pen"
+        case .highlighter: return "Highlighter"
+        case .eraser:      return "Eraser"
+        }
+    }
+
+    /// SF Symbol shown in the toolbar's tool-menu label.
+    var symbolName: String {
+        switch self {
+        case .pen:         return "pencil.tip"
+        case .highlighter: return "highlighter"
+        case .eraser:      return "eraser"
+        }
+    }
 }
 
 /// Fixed palette of pen colors offered in the reader toolbar.
@@ -102,6 +131,108 @@ enum PenWidth: String, CaseIterable, Identifiable, Hashable {
     /// tints it with the row's foreground color (visible in both
     /// light and dark mode). Same UIMenu-bridge constraint as the
     /// `PenColor.swatchAssetName` rationale.
+    var iconAssetName: String {
+        switch self {
+        case .thin:   return "WidthThin"
+        case .medium: return "WidthMedium"
+        case .thick:  return "WidthThick"
+        }
+    }
+}
+
+/// Highlighter palette. Mirrors the five colors of PumiceCore's
+/// `HighlightColor` (the PRD-canonical taxonomy used for /Highlight
+/// annotations and `#highlight/{slug}` Markdown tags).
+enum HighlightPenColor: String, CaseIterable, Identifiable, Hashable {
+    case yellow
+    case green
+    case blue
+    case red
+    case purple
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .yellow: return "Yellow"
+        case .green:  return "Green"
+        case .blue:   return "Blue"
+        case .red:    return "Red"
+        case .purple: return "Purple"
+        }
+    }
+
+    var highlightColor: HighlightColor {
+        switch self {
+        case .yellow: return .yellow
+        case .green:  return .green
+        case .blue:   return .blue
+        case .red:    return .red
+        case .purple: return .purple
+        }
+    }
+
+    /// Canonical RGBA for live-preview rendering. Matches
+    /// `HighlightColor.rgba` from PumiceCore so the on-canvas band
+    /// reads the same hue as the saved `/Highlight`.
+    var uiColor: UIColor {
+        let rgba = highlightColor.rgba
+        return UIColor(
+            red: rgba.red,
+            green: rgba.green,
+            blue: rgba.blue,
+            alpha: rgba.alpha
+        )
+    }
+
+    /// Asset-catalog name for the toolbar swatch. Translucent rounded
+    /// rectangles so the highlighter rows read visually distinct from
+    /// the pen rows (solid circles).
+    var swatchAssetName: String {
+        switch self {
+        case .yellow: return "HighlightSwatchYellow"
+        case .green:  return "HighlightSwatchGreen"
+        case .blue:   return "HighlightSwatchBlue"
+        case .red:    return "HighlightSwatchRed"
+        case .purple: return "HighlightSwatchPurple"
+        }
+    }
+}
+
+/// Highlighter live-preview widths. These never affect the final
+/// `/Highlight` annotation — the snap step always uses each line's
+/// own text-bounds height. They only set how thick the in-progress
+/// drag reads on screen, so the user can pick whichever feels right.
+enum HighlightWidth: String, CaseIterable, Identifiable, Hashable {
+    case thin
+    case medium
+    case thick
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .thin:   return "Thin"
+        case .medium: return "Medium"
+        case .thick:  return "Thick"
+        }
+    }
+
+    /// Live-preview band height in canvas points. Tuned for typical
+    /// 12pt body text on US Letter — Medium roughly matches a line
+    /// height, Thin reads as an underline, Thick covers chunky display
+    /// text without bleeding visually into the line below.
+    var points: CGFloat {
+        switch self {
+        case .thin:   return 8
+        case .medium: return 14
+        case .thick:  return 22
+        }
+    }
+
+    /// Reuses the pen width icons. The PNGs are template-rendered, so
+    /// they pick up whatever foreground color the menu row is using —
+    /// no separate highlight-specific assets needed.
     var iconAssetName: String {
         switch self {
         case .thin:   return "WidthThin"

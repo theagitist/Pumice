@@ -143,20 +143,23 @@ struct VaultBrowserView: View {
             ContentUnavailableView(
                 "Pick a PDF",
                 systemImage: "doc.text",
-                description: Text("Browse folders on the left and tap a PDF to read it. Draw with Apple Pencil; press the pencil to toggle the eraser.")
+                description: Text("Browse folders on the left and tap a PDF to read it. Draw with Apple Pencil; double-tap the pencil to alternate pen and highlighter; squeeze and hold for the eraser.")
             )
         }
     }
 
     @ToolbarContentBuilder
     private var readerToolbar: some ToolbarContent {
-        // Keep the tool menu in its OWN ToolbarItem rather than inside
-        // a group. Grouped items render as a tight cluster on iPad and
-        // the menu icon sat right next to the undo button, leading to
-        // adjacent-button hit overlap. A standalone ToolbarItem gets
-        // its own full-size hit target.
+        // Keep each menu in its OWN ToolbarItem rather than grouped.
+        // Grouped items render as a tight cluster on iPad and adjacent
+        // icons can get hit-test overlap. Separate ToolbarItems each
+        // get a full-size 44pt hit target.
         ToolbarItem(placement: .topBarTrailing) {
             toolMenu
+        }
+
+        ToolbarItem(placement: .topBarTrailing) {
+            colorMenu
         }
 
         ToolbarItemGroup(placement: .topBarTrailing) {
@@ -196,53 +199,97 @@ struct VaultBrowserView: View {
 
     private var toolMenu: some View {
         Menu {
-            Picker("Tool", selection: $readerController.isEraserActive) {
-                Label("Pen", systemImage: "pencil.tip").tag(false)
-                Label("Eraser", systemImage: "eraser").tag(true)
-            }
-
-            // Don't `.disabled()` these pickers when eraser is active —
-            // that conditional modifier forces SwiftUI to rebuild the
-            // menu content on every eraser toggle, which collides with
-            // the toolbar Menu's tap gesture (visible in logs as
-            // `updateVisibleMenuWithBlock while no context menu is
-            // visible`). Letting the user pick a color/width while in
-            // eraser mode just queues those settings for the next pen
-            // stroke; no harm in always allowing it.
-            // Asset-catalog images for the swatch icons. SwiftUI Menu
-            // bridges Pickers to UIMenu, which only knows how to carry
-            // a title and a UIImage per option — Shape views and
-            // SwiftUI modifiers don't survive the bridge. The Swatch*
-            // imagesets bake the color into the PNG (rendering-intent
-            // "original" so iOS doesn't tint them), and the Width*
-            // imagesets are template-rendered so the menu tints the
-            // line to match the row's foreground color.
-            Picker("Color", selection: $readerController.penColor) {
-                ForEach(PenColor.allCases) { color in
-                    Label(color.displayName, image: color.swatchAssetName)
-                        .tag(color)
-                }
-            }
-
-            Picker("Width", selection: $readerController.penWidth) {
-                ForEach(PenWidth.allCases) { width in
-                    Label(width.displayName, image: width.iconAssetName)
-                        .tag(width)
+            Picker("Tool", selection: $readerController.activeTool) {
+                ForEach(Tool.allCases) { tool in
+                    Label(tool.displayName, systemImage: tool.symbolName)
+                        .tag(tool)
                 }
             }
         } label: {
             // Explicit 44pt hit target (Apple HIG minimum) plus
             // `.contentShape(Rectangle())` so taps anywhere in the
             // frame count, not just on the symbol's filled pixels.
-            // Without this the iPad toolbar would size the button to
-            // the SF Symbol's tight bounds, which is part of why taps
-            // landed only occasionally.
-            Image(systemName: readerController.isEraserActive ? "eraser" : "pencil.tip")
+            Image(systemName: readerController.activeTool.symbolName)
                 .font(.title3)
                 .frame(width: 44, height: 44, alignment: .center)
                 .contentShape(Rectangle())
         }
-        .accessibilityLabel("Pen and eraser settings")
+        .accessibilityLabel("Tool picker")
+    }
+
+    /// Color + width menu. The menu body always renders the SAME four
+    /// pickers (pen color, pen width, highlight color, highlight width)
+    /// regardless of active tool — conditional menu content collides
+    /// with the toolbar Menu's tap recognizer on iPad (visible in logs
+    /// as `updateVisibleMenuWithBlock while no context menu is
+    /// visible`).
+    ///
+    /// The menu label shows the swatch of the currently active tool's
+    /// selected color so the toolbar reflects what you'd be drawing
+    /// with. For eraser, falls back to a generic palette glyph.
+    ///
+    /// Asset-catalog images: SwiftUI Menu bridges Pickers to UIMenu,
+    /// which only carries a title + UIImage per option — Shape views
+    /// and SwiftUI modifiers don't survive the bridge. The pen
+    /// `Swatch*` PNGs are rendering-intent "original" so iOS doesn't
+    /// tint them; the `Width*` PNGs are template-rendered so menu
+    /// rows tint them to match the foreground color.
+    private var colorMenu: some View {
+        Menu {
+            Section("Pen") {
+                Picker("Color", selection: $readerController.penColor) {
+                    ForEach(PenColor.allCases) { color in
+                        Label(color.displayName, image: color.swatchAssetName)
+                            .tag(color)
+                    }
+                }
+                Picker("Width", selection: $readerController.penWidth) {
+                    ForEach(PenWidth.allCases) { width in
+                        Label(width.displayName, image: width.iconAssetName)
+                            .tag(width)
+                    }
+                }
+            }
+            Section("Highlighter") {
+                Picker("Color", selection: $readerController.highlightColor) {
+                    ForEach(HighlightPenColor.allCases) { color in
+                        Label(color.displayName, image: color.swatchAssetName)
+                            .tag(color)
+                    }
+                }
+                Picker("Width", selection: $readerController.highlightWidth) {
+                    ForEach(HighlightWidth.allCases) { width in
+                        Label(width.displayName, image: width.iconAssetName)
+                            .tag(width)
+                    }
+                }
+            }
+        } label: {
+            colorMenuLabel
+                .font(.title3)
+                .frame(width: 44, height: 44, alignment: .center)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Color and width picker")
+    }
+
+    @ViewBuilder
+    private var colorMenuLabel: some View {
+        switch readerController.activeTool {
+        case .pen:
+            Image(readerController.penColor.swatchAssetName)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 22, height: 22)
+        case .highlighter:
+            Image(readerController.highlightColor.swatchAssetName)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 22, height: 22)
+        case .eraser:
+            Image(systemName: "paintpalette")
+                .opacity(0.4)
+        }
     }
 
     private func loadTree() async {
