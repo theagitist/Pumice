@@ -41,7 +41,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.example.Pumice
         PRODUCT_NAME: Pumice
-        DEVELOPMENT_TEAM: FD6PKQD878
+        DEVELOPMENT_TEAM: REDACTED
         CODE_SIGN_STYLE: Automatic
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
@@ -66,7 +66,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.example.PumiceTests
-        DEVELOPMENT_TEAM: FD6PKQD878
+        DEVELOPMENT_TEAM: REDACTED
         CODE_SIGN_STYLE: Automatic
         GENERATE_INFOPLIST_FILE: YES
         BUNDLE_LOADER: "$(TEST_HOST)"

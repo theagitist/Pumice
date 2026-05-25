@@ -2,6 +2,15 @@ import PDFKit
 import PumiceCore
 import UIKit
 
+/// PDFView's inner scrollview isn't part of its public API. The
+/// Cookiezby working reference exposes it via subview enumeration so
+/// it can disable scrolling while editing. We use the same trick.
+private extension PDFView {
+    var privateScrollView: UIScrollView? {
+        subviews.first as? UIScrollView
+    }
+}
+
 /// PDFPage subclass returned by `PDFDocumentDelegate.classForPage()`.
 /// Cookiezby's working `PDFPageOverlayViewProvider` reference uses a
 /// custom subclass; we mirror that pattern in case PDFKit requires
