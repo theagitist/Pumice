@@ -1,0 +1,26 @@
+{
+  "images": [
+    {
+      "filename": "WidthThick.png",
+      "idiom": "universal",
+      "scale": "1x"
+    },
+    {
+      "filename": "WidthThick@2x.png",
+      "idiom": "universal",
+      "scale": "2x"
+    },
+    {
+      "filename": "WidthThick@3x.png",
+      "idiom": "universal",
+      "scale": "3x"
+    }
+  ],
+  "info": {
+    "author": "xcode",
+    "version": 1
+  },
+  "properties": {
+    "template-rendering-intent": "template"
+  }
+}

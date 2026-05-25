@@ -40,62 +40,143 @@ final class PumicePDFDocumentDelegate: NSObject, @unchecked Sendable, PDFDocumen
 /// it on load.
 final class PumiceOverlayProvider: NSObject, @unchecked Sendable {
     private let lock = NSLock()
-    private var pathsForPage: [PDFPage: [UIBezierPath]] = [:]
+    private var strokesForPage: [PDFPage: [StrokeRecord]] = [:]
     private var canvasByPage: [PDFPage: PumiceCanvasView] = [:]
 
-    /// Called whenever a new stroke is finished on any canvas. Runs
-    /// on the main queue (canvases live on main).
-    var onPathFinished: (@MainActor () -> Void)?
+    /// Current pen settings. Applied to every new canvas as it is
+    /// created, and pushed onto live canvases via the setters below
+    /// when the user changes them from the toolbar.
+    @MainActor private var penColor: UIColor = .systemBlue
+    @MainActor private var penWidth: CGFloat = 3
+    @MainActor private var isEraserActive: Bool = false
 
-    func setPaths(_ paths: [UIBezierPath], for page: PDFPage) {
+    /// Called whenever a new stroke is finished on any canvas. Receives
+    /// the page and the freshly committed record so the controller can
+    /// register an undo action for it.
+    var onPathFinished: (@MainActor (PDFPage, StrokeRecord) -> Void)?
+
+    /// Called when an eraser gesture finishes on a canvas, carrying
+    /// every stroke the gesture rubbed out. The canvas has already
+    /// removed them from its own state; the provider mirrors that into
+    /// `strokesForPage` and the controller registers the undo batch.
+    var onEraserStroke: (@MainActor (PDFPage, [StrokeRecord]) -> Void)?
+
+    func setStrokes(_ strokes: [StrokeRecord], for page: PDFPage) {
         lock.lock(); defer { lock.unlock() }
-        pathsForPage[page] = paths
+        strokesForPage[page] = strokes
     }
 
-    func paths(for page: PDFPage) -> [UIBezierPath]? {
+    func strokes(for page: PDFPage) -> [StrokeRecord]? {
         lock.lock(); defer { lock.unlock() }
-        return pathsForPage[page]
+        return strokesForPage[page]
     }
 
-    func allPaths() -> [PDFPage: [UIBezierPath]] {
+    func allStrokes() -> [PDFPage: [StrokeRecord]] {
         lock.lock(); defer { lock.unlock() }
-        return pathsForPage
+        return strokesForPage
     }
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
-        pathsForPage.removeAll()
+        strokesForPage.removeAll()
         canvasByPage.removeAll()
     }
 
     /// Sync any currently-active canvases' drawings back into the
-    /// path store. Call from save() before writing the document, to
+    /// stroke store. Call from save() before writing the document, to
     /// capture drawings on pages that haven't scrolled out of view.
     @MainActor func syncActiveCanvases() {
         lock.lock(); defer { lock.unlock() }
         for (page, canvas) in canvasByPage {
-            pathsForPage[page] = canvas.paths
+            strokesForPage[page] = canvas.strokes
         }
     }
+
+    /// Append a stroke to a page's list and mirror the update on the
+    /// active canvas if one is on-screen. Used by undo/redo — stroke
+    /// creation goes through the canvas's own gesture path.
+    @MainActor func appendStroke(_ stroke: StrokeRecord, to page: PDFPage) {
+        lock.lock()
+        var existing = strokesForPage[page] ?? []
+        existing.append(stroke)
+        strokesForPage[page] = existing
+        let activeCanvas = canvasByPage[page]
+        lock.unlock()
+        activeCanvas?.setStrokes(existing)
+    }
+
+    /// Remove a specific stroke (matched by path object identity) from
+    /// a page's list and refresh the active canvas if it's on-screen.
+    @MainActor func removeStroke(_ stroke: StrokeRecord, from page: PDFPage) {
+        lock.lock()
+        var existing = strokesForPage[page] ?? []
+        existing.removeAll { $0.path === stroke.path }
+        strokesForPage[page] = existing
+        let activeCanvas = canvasByPage[page]
+        lock.unlock()
+        activeCanvas?.setStrokes(existing)
+    }
+
+    @MainActor func setPenColor(_ color: UIColor) {
+        penColor = color
+        lock.lock()
+        let canvases = Array(canvasByPage.values)
+        lock.unlock()
+        for canvas in canvases { canvas.penColor = color }
+    }
+
+    @MainActor func setPenWidth(_ width: CGFloat) {
+        penWidth = width
+        lock.lock()
+        let canvases = Array(canvasByPage.values)
+        lock.unlock()
+        for canvas in canvases { canvas.penWidth = width }
+    }
+
+    @MainActor func setEraserActive(_ active: Bool) {
+        isEraserActive = active
+        lock.lock()
+        let canvases = Array(canvasByPage.values)
+        lock.unlock()
+        for canvas in canvases { canvas.isEraserActive = active }
+    }
+
+    @MainActor var currentPenColor: UIColor { penColor }
+    @MainActor var currentPenWidth: CGFloat { penWidth }
+    @MainActor var currentEraserActive: Bool { isEraserActive }
 }
 
 extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
     @MainActor
     func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> UIView? {
-        print("[Pumice] (provider) overlayViewFor page=\(view.document?.index(for: page) ?? -1)")
         let canvas = PumiceCanvasView()
-        let existing: [UIBezierPath]? = {
+        canvas.penColor = penColor
+        canvas.penWidth = penWidth
+        canvas.isEraserActive = isEraserActive
+        let existing: [StrokeRecord]? = {
             lock.lock(); defer { lock.unlock() }
-            return pathsForPage[page]
+            return strokesForPage[page]
         }()
-        if let existing { canvas.setPaths(existing) }
-        canvas.onPathFinished = { [weak self, weak page] _ in
+        if let existing { canvas.setStrokes(existing) }
+        canvas.onPathFinished = { [weak self, weak page] stroke in
             guard let self, let page else { return }
             self.lock.lock()
-            self.pathsForPage[page] = canvas.paths
+            self.strokesForPage[page] = canvas.strokes
             self.lock.unlock()
             DispatchQueue.main.async { [weak self] in
-                self?.onPathFinished?()
+                self?.onPathFinished?(page, stroke)
+            }
+        }
+        canvas.onEraserStroke = { [weak self, weak page] removedBatch in
+            guard let self, let page else { return }
+            // Canvas has already removed these strokes from its own
+            // list. Mirror that into our authoritative store so save
+            // and re-display stay in sync.
+            self.lock.lock()
+            self.strokesForPage[page] = canvas.strokes
+            self.lock.unlock()
+            DispatchQueue.main.async { [weak self] in
+                self?.onEraserStroke?(page, removedBatch)
             }
         }
         lock.lock()
@@ -115,9 +196,8 @@ extension PumiceOverlayProvider: @preconcurrency PDFPageOverlayViewProvider {
     @MainActor
     func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
         guard let canvas = overlayView as? PumiceCanvasView else { return }
-        print("[Pumice] (provider) willEnd page=\(pdfView.document?.index(for: page) ?? -1) strokes=\(canvas.paths.count)")
         lock.lock()
-        pathsForPage[page] = canvas.paths
+        strokesForPage[page] = canvas.strokes
         canvasByPage.removeValue(forKey: page)
         lock.unlock()
     }
@@ -159,8 +239,6 @@ final class PDFReaderViewController: UIViewController {
 
     private let _undoManager = UndoManager()
     private let documentDelegate = PumicePDFDocumentDelegate()
-    private var selectedAnnotation: PDFAnnotation?
-    private var selectedAnnotationPage: PDFPage?
 
     weak var controller: PDFReaderController?
 
@@ -168,7 +246,6 @@ final class PDFReaderViewController: UIViewController {
 
     var canUndoChange: Bool { _undoManager.canUndo }
     var canRedoChange: Bool { _undoManager.canRedo }
-    var hasSelectedAnnotation: Bool { selectedAnnotation != nil }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -180,18 +257,19 @@ final class PDFReaderViewController: UIViewController {
         // pdfView.document had no effect in past iterations.
         pdfView.pageOverlayViewProvider = overlayProvider
         pdfView.isInMarkupMode = true
-        overlayProvider.onPathFinished = { [weak self] in
-            self?.needsSave = true
-            self?.controller?.refreshState()
+        overlayProvider.onPathFinished = { [weak self] page, stroke in
+            guard let self else { return }
+            self.registerUndoForAddedStroke(stroke: stroke, on: page)
+            self.needsSave = true
+            self.controller?.refreshState()
         }
-        print("[Pumice] viewDidLoad: provider wired (separate object), markup=\(pdfView.isInMarkupMode)")
+        overlayProvider.onEraserStroke = { [weak self] page, removedBatch in
+            guard let self else { return }
+            self.handleEraserBatch(removed: removedBatch, on: page)
+        }
 
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(annotationWasHit(_:)),
-            name: .PDFViewAnnotationHit,
-            object: pdfView
-        )
+        installUndoRedoGestures()
+        installPencilInteraction()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -214,55 +292,53 @@ final class PDFReaderViewController: UIViewController {
         pdfURL = url
         needsSave = false
         _undoManager.removeAllActions()
-        selectedAnnotation = nil
-        selectedAnnotationPage = nil
         overlayProvider.reset()
         controller?.refreshState()
 
         guard let document = PDFDocument(url: url) else { return }
         document.delegate = documentDelegate
         pdfView.document = document
-        let providerKind = pdfView.pageOverlayViewProvider.map { String(describing: type(of: $0)) } ?? "nil"
-        print("[Pumice] load: pages=\(document.pageCount) markup=\(pdfView.isInMarkupMode) providerKind=\(providerKind)")
 
-        // Hydrate per-page paths from any /Ink annotations already in
+        // Hydrate per-page strokes from any /Ink annotations already in
         // the file. We strip them from the model so they don't double-
-        // up with what the canvas renders.
-        var hydratedPages = 0
+        // up with what the canvas renders. Each annotation's color and
+        // border width are preserved so re-saves don't flatten styling
+        // back to a single palette.
         for i in 0..<document.pageCount {
             guard let page = document.page(at: i) else { continue }
             let inkAnnotations = page.annotations.filter { $0.type == "Ink" }
             let pageHeight = page.bounds(for: .mediaBox).height
-            var canvasPaths: [UIBezierPath] = []
+            var canvasStrokes: [StrokeRecord] = []
             for ann in inkAnnotations {
+                let color = ann.color
+                let width = ann.border?.lineWidth ?? 2
                 for pathInPage in ann.paths ?? [] {
-                    canvasPaths.append(Self.canvasPath(fromPagePath: pathInPage, pageHeight: pageHeight))
+                    let canvasPath = Self.canvasPath(fromPagePath: pathInPage, pageHeight: pageHeight)
+                    canvasStrokes.append(StrokeRecord(path: canvasPath, color: color, width: width))
                 }
             }
-            if !canvasPaths.isEmpty {
-                overlayProvider.setPaths(canvasPaths, for: page)
-                hydratedPages += 1
+            if !canvasStrokes.isEmpty {
+                overlayProvider.setStrokes(canvasStrokes, for: page)
             }
             for ann in inkAnnotations {
                 page.removeAnnotation(ann)
             }
         }
-        print("[Pumice] load: \(hydratedPages) pages with prior strokes")
     }
 
     func saveIfNeeded() {
         guard needsSave, let url = pdfURL, let document = pdfView.document else { return }
         overlayProvider.syncActiveCanvases()
-        let snapshot = overlayProvider.allPaths()
-        for (page, paths) in snapshot {
+        let snapshot = overlayProvider.allStrokes()
+        for (page, strokes) in snapshot {
             for ann in page.annotations where ann.type == "Ink" {
                 page.removeAnnotation(ann)
             }
             let pageIndex = document.index(for: page)
             let pageHeight = page.bounds(for: .mediaBox).height
-            for canvasPath in paths {
+            for stroke in strokes {
                 guard let annotation = Self.inkAnnotation(
-                    fromCanvasPath: canvasPath,
+                    fromStroke: stroke,
                     pageIndex: pageIndex,
                     pageHeight: pageHeight
                 ) else { continue }
@@ -271,21 +347,24 @@ final class PDFReaderViewController: UIViewController {
         }
         if document.write(to: url) {
             needsSave = false
-            print("[Pumice] save: wrote \(snapshot.count) page-strokes to \(url.lastPathComponent)")
         }
     }
 
-    // MARK: - Annotation toolbar actions
+    // MARK: - Tool settings
 
-    func deleteSelectedAnnotation() {
-        guard let annotation = selectedAnnotation,
-              let page = selectedAnnotationPage else { return }
-        page.removeAnnotation(annotation)
-        selectedAnnotation = nil
-        selectedAnnotationPage = nil
-        needsSave = true
-        controller?.refreshState()
+    func setPenColor(_ color: UIColor) {
+        overlayProvider.setPenColor(color)
     }
+
+    func setPenWidth(_ width: CGFloat) {
+        overlayProvider.setPenWidth(width)
+    }
+
+    func setEraserActive(_ active: Bool) {
+        overlayProvider.setEraserActive(active)
+    }
+
+    // MARK: - Toolbar actions
 
     func undoLastChange() {
         _undoManager.undo()
@@ -297,18 +376,111 @@ final class PDFReaderViewController: UIViewController {
         controller?.refreshState()
     }
 
-    @objc private func annotationWasHit(_ notification: Notification) {
-        guard let hit = notification.userInfo?["PDFAnnotationHit"] as? PDFAnnotation else {
-            return
+    // MARK: - Stroke undo/redo
+
+    /// Called from the overlay provider's onPathFinished closure right
+    /// after a brand-new stroke lands in the stroke store. Registers
+    /// the inverse (remove) as an undoable action; that action in turn
+    /// registers its own inverse (re-add) on invocation, so the user
+    /// can step through the full undo/redo chain.
+    private func registerUndoForAddedStroke(stroke: StrokeRecord, on page: PDFPage) {
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performUndoRemoveStroke(stroke: stroke, on: page)
         }
-        if selectedAnnotation === hit {
-            selectedAnnotation = nil
-            selectedAnnotationPage = nil
-        } else {
-            selectedAnnotation = hit
-            selectedAnnotationPage = hit.page
+    }
+
+    private func performUndoRemoveStroke(stroke: StrokeRecord, on page: PDFPage) {
+        overlayProvider.removeStroke(stroke, from: page)
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performRedoAddStroke(stroke: stroke, on: page)
         }
+        needsSave = true
         controller?.refreshState()
+    }
+
+    private func performRedoAddStroke(stroke: StrokeRecord, on page: PDFPage) {
+        overlayProvider.appendStroke(stroke, to: page)
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performUndoRemoveStroke(stroke: stroke, on: page)
+        }
+        needsSave = true
+        controller?.refreshState()
+    }
+
+    // MARK: - Eraser
+
+    /// Called when the eraser gesture finishes on a page's canvas.
+    /// The canvas erased strokes in real-time as the gesture passed
+    /// over them; here we just register an undoable batch so a single
+    /// Undo restores all of them at once.
+    private func handleEraserBatch(removed: [StrokeRecord], on page: PDFPage) {
+        guard !removed.isEmpty else { return }
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performUndoRestoreStrokes(removed, on: page)
+        }
+        needsSave = true
+        controller?.refreshState()
+    }
+
+    private func performUndoRestoreStrokes(_ strokes: [StrokeRecord], on page: PDFPage) {
+        for stroke in strokes {
+            overlayProvider.appendStroke(stroke, to: page)
+        }
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performRedoEraseStrokes(strokes, on: page)
+        }
+        needsSave = true
+        controller?.refreshState()
+    }
+
+    private func performRedoEraseStrokes(_ strokes: [StrokeRecord], on page: PDFPage) {
+        for stroke in strokes {
+            overlayProvider.removeStroke(stroke, from: page)
+        }
+        _undoManager.registerUndo(withTarget: self) { target in
+            target.performUndoRestoreStrokes(strokes, on: page)
+        }
+        needsSave = true
+        controller?.refreshState()
+    }
+
+    // MARK: - Gesture shortcuts
+
+    /// Two-finger double-tap → undo. The three-finger swipe-left/right
+    /// gestures Apple ships system-wide work for free because we
+    /// override `undoManager` above; iOS finds it via the responder
+    /// chain and invokes undo/redo without us installing recognizers.
+    /// Earlier we ALSO installed our own three-finger swipe gestures,
+    /// but those raced the system pair, producing
+    /// `System gesture gate timed out` errors and steady main-thread
+    /// stalls that visibly jammed the toolbar Menu's tap response.
+    private func installUndoRedoGestures() {
+        let undoTap = UITapGestureRecognizer(target: self, action: #selector(undoGestureFired))
+        undoTap.numberOfTapsRequired = 2
+        undoTap.numberOfTouchesRequired = 2
+        view.addGestureRecognizer(undoTap)
+    }
+
+    @objc private func undoGestureFired() {
+        undoLastChange()
+    }
+
+    // MARK: - Apple Pencil press → toggle eraser
+
+    /// Apple Pencil 2 reports the side double-tap and Apple Pencil Pro
+    /// reports the barrel squeeze through the same `UIPencilInteraction`
+    /// delegate. We use either to flip eraser mode, ignoring the
+    /// user's system-wide preferred-tap action — the toolbar Menu is
+    /// always there as a backup, and "press to erase" is consistent
+    /// with how Notes treats the pencil.
+    private func installPencilInteraction() {
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        view.addInteraction(interaction)
+    }
+
+    private func toggleEraserFromPencil() {
+        controller?.isEraserActive.toggle()
     }
 
     // MARK: - Plumbing
@@ -321,7 +493,6 @@ final class PDFReaderViewController: UIViewController {
         pdfView.usePageViewController(false)
         pdfView.backgroundColor = .systemGroupedBackground
         view.addSubview(pdfView)
-        print("[Pumice] configurePDFView: pdfView added to view hierarchy")
 
         NSLayoutConstraint.activate([
             pdfView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -350,16 +521,18 @@ final class PDFReaderViewController: UIViewController {
         return self.pagePath(fromCanvasPath: pagePath, pageHeight: pageHeight)
     }
 
-    /// Convert a canvas-coord bezier path into a standard `/Ink`
-    /// PDFAnnotation via PumiceCore's builder. Flattens the path's
-    /// move/line elements into a point list — the builder smooths
-    /// them into a curve internally.
+    /// Convert a `StrokeRecord` into a standard `/Ink` PDFAnnotation
+    /// via PumiceCore's builder. Flattens the canvas-coord path's
+    /// move/line elements into page-coord points — the builder smooths
+    /// them into a curve internally — and carries the stroke's own
+    /// color and width onto the annotation so per-stroke styling
+    /// survives the round-trip.
     static func inkAnnotation(
-        fromCanvasPath canvasPath: UIBezierPath,
+        fromStroke stroke: StrokeRecord,
         pageIndex: Int,
         pageHeight: CGFloat
     ) -> PDFAnnotation? {
-        let pagePath = self.pagePath(fromCanvasPath: canvasPath, pageHeight: pageHeight)
+        let pagePath = self.pagePath(fromCanvasPath: stroke.path, pageHeight: pageHeight)
         var pagePoints: [CGPoint] = []
         pagePath.cgPath.applyWithBlock { ptr in
             let elem = ptr.pointee
@@ -373,8 +546,8 @@ final class PDFReaderViewController: UIViewController {
         guard pagePoints.count >= 2 else { return nil }
         return InkAnnotationBuilder.makeAnnotation(
             pagePoints: pagePoints,
-            pageStrokeWidth: 2,
-            color: StrokeColor(uiColor: .label),
+            pageStrokeWidth: stroke.width,
+            color: StrokeColor(uiColor: stroke.color),
             pageIndex: pageIndex,
             uuid: UUID()
         )
@@ -405,6 +578,18 @@ final class PDFReaderViewController: UIViewController {
             attachedNote: nil
         )
         return HighlightAnnotationBuilder.makeAnnotation(highlight: highlight, uuid: UUID())
+    }
+}
+
+extension PDFReaderViewController: UIPencilInteractionDelegate {
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
+        toggleEraserFromPencil()
+    }
+
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        // Only act on the squeeze's end so a long hold doesn't oscillate.
+        guard squeeze.phase == .ended else { return }
+        toggleEraserFromPencil()
     }
 }
 

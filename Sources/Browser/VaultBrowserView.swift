@@ -143,13 +143,22 @@ struct VaultBrowserView: View {
             ContentUnavailableView(
                 "Pick a PDF",
                 systemImage: "doc.text",
-                description: Text("Browse folders on the left and tap a PDF to read it. Tap an annotation to select it, then use the toolbar to delete or undo.")
+                description: Text("Browse folders on the left and tap a PDF to read it. Draw with Apple Pencil; press the pencil to toggle the eraser.")
             )
         }
     }
 
     @ToolbarContentBuilder
     private var readerToolbar: some ToolbarContent {
+        // Keep the tool menu in its OWN ToolbarItem rather than inside
+        // a group. Grouped items render as a tight cluster on iPad and
+        // the menu icon sat right next to the undo button, leading to
+        // adjacent-button hit overlap. A standalone ToolbarItem gets
+        // its own full-size hit target.
+        ToolbarItem(placement: .topBarTrailing) {
+            toolMenu
+        }
+
         ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
                 readerController.undo()
@@ -166,15 +175,58 @@ struct VaultBrowserView: View {
             }
             .disabled(!readerController.canRedo)
             .help("Redo")
-
-            Button(role: .destructive) {
-                readerController.deleteSelectedAnnotation()
-            } label: {
-                Image(systemName: "trash")
-            }
-            .disabled(!readerController.hasSelectedAnnotation)
-            .help("Delete selected annotation")
         }
+    }
+
+    private var toolMenu: some View {
+        Menu {
+            Picker("Tool", selection: $readerController.isEraserActive) {
+                Label("Pen", systemImage: "pencil.tip").tag(false)
+                Label("Eraser", systemImage: "eraser").tag(true)
+            }
+
+            // Don't `.disabled()` these pickers when eraser is active —
+            // that conditional modifier forces SwiftUI to rebuild the
+            // menu content on every eraser toggle, which collides with
+            // the toolbar Menu's tap gesture (visible in logs as
+            // `updateVisibleMenuWithBlock while no context menu is
+            // visible`). Letting the user pick a color/width while in
+            // eraser mode just queues those settings for the next pen
+            // stroke; no harm in always allowing it.
+            // Asset-catalog images for the swatch icons. SwiftUI Menu
+            // bridges Pickers to UIMenu, which only knows how to carry
+            // a title and a UIImage per option — Shape views and
+            // SwiftUI modifiers don't survive the bridge. The Swatch*
+            // imagesets bake the color into the PNG (rendering-intent
+            // "original" so iOS doesn't tint them), and the Width*
+            // imagesets are template-rendered so the menu tints the
+            // line to match the row's foreground color.
+            Picker("Color", selection: $readerController.penColor) {
+                ForEach(PenColor.allCases) { color in
+                    Label(color.displayName, image: color.swatchAssetName)
+                        .tag(color)
+                }
+            }
+
+            Picker("Width", selection: $readerController.penWidth) {
+                ForEach(PenWidth.allCases) { width in
+                    Label(width.displayName, image: width.iconAssetName)
+                        .tag(width)
+                }
+            }
+        } label: {
+            // Explicit 44pt hit target (Apple HIG minimum) plus
+            // `.contentShape(Rectangle())` so taps anywhere in the
+            // frame count, not just on the symbol's filled pixels.
+            // Without this the iPad toolbar would size the button to
+            // the SF Symbol's tight bounds, which is part of why taps
+            // landed only occasionally.
+            Image(systemName: readerController.isEraserActive ? "eraser" : "pencil.tip")
+                .font(.title3)
+                .frame(width: 44, height: 44, alignment: .center)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Pen and eraser settings")
     }
 
     private func loadTree() async {
