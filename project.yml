@@ -43,7 +43,13 @@ targets:
       base:
         PRODUCT_NAME: Pumice
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # The Generation flag's nested-key auto-mapping (UIImageName etc.)
+        # doesn't fire correctly in Xcode 26 — it produces a malformed
+        # UILaunchScreen { UILaunchScreen {} } and the image never shows.
+        # Use a real launch storyboard instead, which is the canonical
+        # way Apple documents and the only path with predictable
+        # behavior across Xcode versions.
+        INFOPLIST_KEY_UILaunchStoryboardName: LaunchScreen
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"

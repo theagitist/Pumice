@@ -71,7 +71,7 @@ struct OnboardingView: View {
                 .font(.footnote)
                 .foregroundStyle(.red)
                 .multilineTextAlignment(.center)
-        case .idle, .open:
+        case .idle, .open, .launching:
             EmptyView()
         }
     }

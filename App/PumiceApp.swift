@@ -18,10 +18,15 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if let url = vault.resolvedURL {
-                VaultBrowserView(vaultURL: url)
-            } else {
-                OnboardingView()
+            switch vault.status {
+            case .launching:
+                LaunchView()
+            default:
+                if let url = vault.resolvedURL {
+                    VaultBrowserView(vaultURL: url)
+                } else {
+                    OnboardingView()
+                }
             }
         }
     }

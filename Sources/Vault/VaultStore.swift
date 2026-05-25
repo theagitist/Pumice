@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class VaultStore: ObservableObject {
     @Published private(set) var resolvedURL: URL?
-    @Published private(set) var status: Status = .idle
+    @Published private(set) var status: Status = .launching
     /// Path of the most recently opened PDF, relative to `resolvedURL`.
     /// Persisted across app launches so the reader can restore the last
     /// document automatically.
@@ -18,6 +18,12 @@ final class VaultStore: ObservableObject {
     private let lastOpenedKey = "\(Bundle.main.bundleIdentifier ?? "Pumice").lastOpenedPDF"
 
     enum Status: Equatable {
+        /// Initial state on app launch, before `resolveOnLaunch()` has
+        /// finished consulting the saved bookmark. The root view shows
+        /// the branded `LaunchView` while we're in this state so the
+        /// user doesn't see a flash of onboarding before we know there
+        /// is a vault.
+        case launching
         case idle
         case open
         case staleBookmark
@@ -26,7 +32,10 @@ final class VaultStore: ObservableObject {
     }
 
     func resolveOnLaunch() async {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey) else { return }
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey) else {
+            status = .idle
+            return
+        }
         do {
             var isStale = false
             let url = try URL(
