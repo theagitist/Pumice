@@ -186,6 +186,7 @@ final class PDFReaderViewController: UIViewController {
         pdfView.isInMarkupMode = true
         pdfView.pageOverlayViewProvider = self
         view.addSubview(pdfView)
+        print("[Pumice] configurePDFView: isInMarkupMode=\(pdfView.isInMarkupMode) provider=\(pdfView.pageOverlayViewProvider != nil)")
 
         NSLayoutConstraint.activate([
             pdfView.topAnchor.constraint(equalTo: view.topAnchor),

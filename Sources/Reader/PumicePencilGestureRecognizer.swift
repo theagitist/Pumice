@@ -23,13 +23,23 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
     weak var pencilDelegate: PumicePencilGestureDelegate?
     private var currentPath: UIBezierPath?
 
+    override init(target: Any?, action: Selector?) {
+        super.init(target: target, action: action)
+        // Explicitly tell iOS this gesture only fires for pencil
+        // touches. Without this, the gesture competes against PDFView's
+        // pan gesture for finger touches too and may lose priority.
+        allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesBegan(touches, with: event)
+        print("[Pumice] gesture touchesBegan count=\(touches.count) types=\(touches.map { $0.type.rawValue })")
         guard let touch = touches.first,
               touch.type == .pencil,
               event.allTouches?.count == 1
         else {
             state = .failed
+            print("[Pumice] gesture failed (not pencil or multi-touch)")
             return
         }
         let path = UIBezierPath()
@@ -38,6 +48,7 @@ final class PumicePencilGestureRecognizer: UIGestureRecognizer {
         path.move(to: touch.location(in: view))
         currentPath = path
         state = .began
+        print("[Pumice] gesture began at \(touch.location(in: view))")
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {

@@ -41,6 +41,7 @@ final class PumiceCanvasView: UIView {
         isOpaque = false
         isUserInteractionEnabled = true
         clipsToBounds = true
+        print("[Pumice] PumiceCanvasView init")
 
         committedLayer.fillColor = nil
         committedLayer.lineCap = .round
@@ -62,6 +63,20 @@ final class PumiceCanvasView: UIView {
         super.layoutSubviews()
         committedLayer.frame = bounds
         liveLayer.frame = bounds
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let result = super.hitTest(point, with: event)
+        let isSelf = result === self
+        if isSelf {
+            print("[Pumice] canvas hitTest HIT self at \(point) bounds=\(bounds)")
+        }
+        return result
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        print("[Pumice] canvas didMoveToWindow window=\(window != nil) bounds=\(bounds) superview=\(superview.map { NSStringFromClass(type(of: $0)) } ?? "nil")")
     }
 
     /// Replace the stored paths and rebuild the committed layer.
