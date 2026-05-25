@@ -9,8 +9,14 @@ straight into Obsidian, Logseq, or any other plain-text knowledge graph.
 
 ## Status
 
-Early development. The product requirements document lives in the author's
-private Obsidian vault and is intentionally not duplicated in this repo.
+Version `0.1.0` — first functional release. Apple Pencil drawing with color and
+width selection, real-time eraser, undo/redo via touch and Pencil press, debounced
+autosave, and cross-app PDF compatibility (annotations render in Preview, Adobe,
+and any standards-conformant viewer) all work on iPadOS hardware. Snap-to-text
+highlights and Markdown extraction are scoped for the next release.
+
+The product requirements document lives in the author's private Obsidian vault
+and is intentionally not duplicated in this repo.
 
 ## Requirements
 
