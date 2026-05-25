@@ -45,8 +45,34 @@ public enum InkAnnotationBuilder {
         pageIndex: Int,
         uuid: UUID = UUID()
     ) -> PDFAnnotation {
-        let cgPath = Stroke.smoothPath(through: pagePoints)
-        let bounds = cgPath.boundingBoxOfPath
+        // Build the saved path as a polyline (move + lineTo through the
+        // original samples). PDF's `/InkList` only encodes point lists,
+        // not curves — iOS PDFKit is supposed to flatten any cubic
+        // Bezier curves we add to an Ink annotation before serializing,
+        // but it doesn't do so reliably: the saved annotation comes out
+        // with an empty InkList, the file viewed in Preview/Files shows
+        // no stroke at all, and Pumice's own round-trip looks fine only
+        // because we hydrate the canvas from the in-memory annotation
+        // before the write strips the data. Passing a polyline avoids
+        // the flatten step entirely.
+        let path = UIBezierPath()
+        guard let firstPoint = pagePoints.first else {
+            // Empty input: hand back a degenerate annotation rather than
+            // crash. Caller should already have guarded on a minimum
+            // point count.
+            return PDFAnnotation(bounds: .zero, forType: .ink, withProperties: nil)
+        }
+        path.move(to: firstPoint)
+        if pagePoints.count == 1 {
+            // Single tap: a zero-length line so the dot still renders.
+            path.addLine(to: firstPoint)
+        } else {
+            for point in pagePoints.dropFirst() {
+                path.addLine(to: point)
+            }
+        }
+
+        let bounds = path.cgPath.boundingBoxOfPath
             .insetBy(dx: -pageStrokeWidth, dy: -pageStrokeWidth)
 
         let id = AnnotationID(pageIndex: pageIndex, annotationUUID: uuid)
@@ -56,10 +82,11 @@ public enum InkAnnotationBuilder {
             withProperties: nil
         )
 
-        // PDFAnnotation's ink path is added in PDF page coordinates, matching
-        // /Rect. PDFKit takes care of writing the /InkList entries when the
-        // page is serialized.
-        annotation.add(UIBezierPath(cgPath: cgPath))
+        // PDFAnnotation's ink path is added in PDF page coordinates,
+        // matching /Rect. With a polyline the /InkList entries are
+        // exactly the move/line vertices, which iOS PDFKit serializes
+        // correctly.
+        annotation.add(path)
 
         annotation.color = color.uiColor
         let border = PDFBorder()
