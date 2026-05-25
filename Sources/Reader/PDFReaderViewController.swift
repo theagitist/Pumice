@@ -4,9 +4,9 @@ import PumiceCore
 import UIKit
 
 /// `PKCanvasView` subclass with an "Apple Pencil only" hit-test mode.
-/// When `requirePencilForHit == true`, the canvas claims a touch only when
-/// the current event contains an Apple Pencil touch — finger touches fall
-/// through to PDFView's scroll gesture.
+/// When `requirePencilForHit == true`, the canvas claims a touch only
+/// when the current event contains an Apple Pencil touch — finger
+/// touches fall through to PDFView's scroll gesture.
 private final class ModalCanvasView: PKCanvasView {
     var requirePencilForHit: Bool = false
 
@@ -322,18 +322,26 @@ extension PDFReaderViewController: @preconcurrency PDFPageOverlayViewProvider {
         canvas.drawingPolicy = allowFingerDrawing ? .anyInput : .pencilOnly
         canvas.requirePencilForHit = !allowFingerDrawing
         canvas.isScrollEnabled = false
-        canvas.minimumZoomScale = 1
-        canvas.maximumZoomScale = 1
         canvas.delegate = self
+        canvas.tool = PKInkingTool(.pen, color: .label, width: 2)
         if let drawing = drawingForPage[page] {
             canvas.drawing = drawing
         }
         canvasByPage[page] = canvas
-        toolPicker.addObserver(canvas)
-        toolPicker.setVisible(true, forFirstResponder: canvas)
-        canvas.becomeFirstResponder()
         print("[Pumice] overlay created for page \(view.document?.index(for: page) ?? -1)")
         return canvas
+    }
+
+    func pdfView(_ pdfView: PDFView, willDisplayOverlayView overlayView: UIView, for page: PDFPage) {
+        // PDFKit has just installed the canvas in the view hierarchy.
+        // becomeFirstResponder and tool-picker setVisible only work once
+        // the view is in a window, so they belong here — not in
+        // overlayViewFor where the canvas is still detached.
+        guard let canvas = overlayView as? PKCanvasView else { return }
+        toolPicker.addObserver(canvas)
+        toolPicker.setVisible(true, forFirstResponder: canvas)
+        let became = canvas.becomeFirstResponder()
+        print("[Pumice] overlay willDisplay page=\(pdfView.document?.index(for: page) ?? -1) becameFirstResponder=\(became)")
     }
 
     func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
